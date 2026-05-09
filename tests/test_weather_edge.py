@@ -756,6 +756,134 @@ class WeatherEdgeTests(unittest.TestCase):
             self.assertEqual(db.execute("select shares, price, cost, source from shadow_fills").fetchone(), (5.0, 0.40, 2.0, "clob_book"))
             db.close()
 
+    def test_dust_entry_below_min_entry_never_fills_official_ledger(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+            args = argparse.Namespace(
+                disable_ledger=False,
+                paper_size=5.0,
+                min_fill_shares=1.0,
+                min_entry=0.02,
+                max_position_pct=0.50,
+                max_city_date_pct=0.50,
+                max_open_exposure_pct=0.50,
+                allow_weak_families=True,
+                disable_weak_families=False,
+                strict_survival_gate=False,
+            )
+            scanner.simulate_paper_order(
+                db,
+                args,
+                run_id=1,
+                signal_id=2,
+                created_at="2026-05-09T00:00:00Z",
+                m={"market_id": "dust", "title": "Dust weather test"},
+                outcome="Yes",
+                token_id="tok-dust",
+                city="New York",
+                target_date="2026-05-09",
+                signal_type="paper_buy_ladder",
+                quote={
+                    "entry_price": 0.001,
+                    "ask": 0.001,
+                    "depth": 10000.0,
+                    "depth_sufficient": True,
+                    "execution_source": "clob_book",
+                    "raw_status": "ok",
+                },
+                event_key="event-dust",
+                candidate_key="cand-dust",
+                strategy_family="ladder_inconsistency",
+            )
+            self.assertEqual(db.execute("select status, reason from paper_orders").fetchone(), ("skipped", "entry_below_min_entry"))
+            self.assertEqual(db.execute("select count(*) from paper_fills").fetchone()[0], 0)
+            self.assertEqual(db.execute("select count(*) from paper_positions").fetchone()[0], 0)
+            self.assertEqual(db.execute("select cash from paper_accounts where name=?", (scanner.DEFAULT_ACCOUNT_NAME,)).fetchone()[0], 1000.0)
+            db.close()
+
+    def test_ladder_inconsistency_shadow_mode_preserves_counterfactual_without_official_fill(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+            args = argparse.Namespace(
+                disable_ledger=False,
+                paper_size=5.0,
+                min_fill_shares=1.0,
+                min_entry=0.02,
+                max_position_pct=0.50,
+                max_city_date_pct=0.50,
+                max_open_exposure_pct=0.50,
+                allow_weak_families=True,
+                disable_weak_families=False,
+                strict_survival_gate=False,
+                shadow_ladder_inconsistency=True,
+            )
+            scanner.simulate_paper_order(
+                db,
+                args,
+                run_id=1,
+                signal_id=2,
+                created_at="2026-05-09T00:00:00Z",
+                m={"market_id": "ladder", "title": "Ladder weather test"},
+                outcome="Yes",
+                token_id="tok-ladder",
+                city="New York",
+                target_date="2026-05-09",
+                signal_type="paper_buy_ladder",
+                quote={
+                    "entry_price": 0.40,
+                    "ask": 0.40,
+                    "depth": 10.0,
+                    "depth_sufficient": True,
+                    "execution_source": "clob_book",
+                    "raw_status": "ok",
+                },
+                event_key="event-ladder",
+                candidate_key="cand-ladder",
+                strategy_family="ladder_inconsistency",
+            )
+            self.assertEqual(db.execute("select status, reason from paper_orders").fetchone(), ("skipped", "strategy_family_shadow_only"))
+            self.assertEqual(db.execute("select count(*) from paper_fills").fetchone()[0], 0)
+            self.assertEqual(db.execute("select count(*) from paper_positions").fetchone()[0], 0)
+            self.assertEqual(db.execute("select shadow_reason, strategy_family from shadow_orders").fetchone(), ("ladder_inconsistency_shadow_only", "ladder_inconsistency"))
+            self.assertEqual(db.execute("select shares, price, cost, source from shadow_fills").fetchone(), (5.0, 0.40, 2.0, "clob_book"))
+            db.close()
+
+    def test_touch_watchlist_seed_activates_near_threshold_candidate(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+            bucket = scanner.parse_bucket("90 or above")
+            spec = scanner.contract_spec_for_bucket(bucket, "Yes")
+            scanner.seed_touch_watchlist_candidate(
+                db,
+                event_key="event-touch",
+                market={"market_id": "m-touch", "title": "Touch watchlist test"},
+                outcome="Yes",
+                token_id="tok-touch",
+                city="New York",
+                station_id="KNYC",
+                target_date="2026-05-09",
+                strategy_family="latency_absorbing_state",
+                contract_spec=spec,
+                observed_high_f=89.0,
+                quote={"ask": 0.40, "bid": 0.39, "depth": 25.0, "depth_sufficient": True},
+                source_confidence="high",
+                timezone_name="America/New_York",
+                now_iso="2026-05-09T16:00:00Z",
+            )
+            row = db.execute(
+                "select active, threshold_f, current_high_f, distance_to_threshold_f, last_seen_ask, strategy_family "
+                "from touch_watchlist where event_key=? and market_id=? and token_id=?",
+                ("event-touch", "m-touch", "tok-touch"),
+            ).fetchone()
+            self.assertEqual(row, (1, 89.5, 89.0, 0.5, 0.40, "latency_absorbing_state"))
+            db.close()
+
+    def test_labeler_uses_read_only_final_label_source_by_default(self):
+        args = scanner.build_parser().parse_args(["label", "--dry-run", "--limit", "0"])
+        self.assertTrue(args.enable_ncei)
+        self.assertFalse(args.enable_nws)
+        self.assertFalse(args.enable_iem)
+
     def test_no_live_trading_guard_blocks_prohibited_options(self):
         self.assertTrue(scanner.ensure_paper_only_guard(argparse.Namespace()))
         with self.assertRaises(ValueError):

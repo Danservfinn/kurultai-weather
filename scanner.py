@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import edge_validation
 import features
 import settlement_states
+import touch_watchlist
 import tuning_evaluator
 import weather_sources
 
@@ -407,6 +408,19 @@ def station_local_date(timezone_name: str | None, when_utc: dt.datetime | None =
     except ZoneInfoNotFoundError:
         return None
     return when.astimezone(zone).date().isoformat()
+
+
+def station_local_hour(timezone_name: str | None, when_utc: dt.datetime | None = None) -> int | None:
+    if not timezone_name:
+        return None
+    when = when_utc or dt.datetime.now(dt.timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    try:
+        zone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return None
+    return int(when.astimezone(zone).hour)
 
 
 def first_present(d: dict[str, Any], keys: Iterable[str]) -> Any:
@@ -2786,12 +2800,13 @@ def record_shadow_survival_gate_fill(
     event_key: str | None,
     candidate_key: str | None,
     strategy_family: str,
+    shadow_reason: str = "survival_gate_disabled",
 ) -> tuple[int | None, int | None]:
-    """Record a separate hypothetical fill for survival-gated families.
+    """Record a separate hypothetical fill for a shadow-only family.
 
     Shadow rows do not touch account cash, positions, or official paper PnL.
-    They preserve counterfactual executable evidence so the survival gate cannot
-    hide whether a blocked family would have improved.
+    They preserve counterfactual executable evidence so a blocked or capped
+    family can keep producing evidence without dominating official fills.
     """
     entry = quote.get("entry_price")
     if (
@@ -2828,7 +2843,7 @@ def record_shadow_survival_gate_fill(
             requested,
             entry,
             cost,
-            "survival_gate_disabled",
+            shadow_reason,
             created_at,
             event_key,
             candidate_key,
@@ -2861,6 +2876,68 @@ def record_shadow_survival_gate_fill(
     return shadow_order_id, int(db.execute("select last_insert_rowid()").fetchone()[0])
 
 
+def paper_buy_shadow_only_family(args: argparse.Namespace, family: str) -> tuple[bool, str | None]:
+    if family == "ladder_inconsistency" and getattr(args, "shadow_ladder_inconsistency", True):
+        return True, "ladder_inconsistency_shadow_only"
+    configured = getattr(args, "shadow_strategy_families", None)
+    if isinstance(configured, str):
+        families = {item.strip() for item in configured.split(",") if item.strip()}
+    elif configured:
+        families = {str(item).strip() for item in configured if str(item).strip()}
+    else:
+        families = set()
+    if family in families:
+        return True, "strategy_family_shadow_only"
+    return False, None
+
+
+def seed_touch_watchlist_candidate(
+    db: sqlite3.Connection,
+    *,
+    event_key: str | None,
+    market: dict[str, Any],
+    outcome: str,
+    token_id: str | None,
+    city: str | None,
+    station_id: str | None,
+    target_date: str | None,
+    strategy_family: str,
+    contract_spec: settlement_states.ContractSpec,
+    observed_high_f: float | None,
+    quote: dict[str, Any],
+    source_confidence: str | None,
+    timezone_name: str | None,
+    now_iso: str,
+) -> None:
+    """Seed/update the hot touch watchlist from ordinary scanner evidence.
+
+    This is paper-only observation plumbing. It does not increase polling cadence
+    by itself and does not place orders; the separate watcher consumes active rows.
+    """
+    threshold = contract_spec.threshold_f
+    if threshold is None or not token_id or not event_key:
+        return
+    candidate = {
+        "event_key": event_key,
+        "market_id": market.get("market_id"),
+        "token_id": token_id,
+        "city": city,
+        "station_id": station_id,
+        "target_date": target_date,
+        "strategy_family": strategy_family,
+        "contract_type": contract_spec.contract_type,
+        "threshold_f": threshold,
+        "side": contract_spec.side,
+        "source_confidence": source_confidence,
+    }
+    hotness = touch_watchlist.compute_hotness_score(
+        candidate,
+        {"high_so_far_f": observed_high_f, "confidence_class": source_confidence},
+        quote,
+        {"local_hour": station_local_hour(timezone_name)},
+    )
+    touch_watchlist.upsert_touch_watchlist(db, candidate, hotness)
+
 
 def simulate_paper_order(
     db: sqlite3.Connection,
@@ -2887,12 +2964,40 @@ def simulate_paper_order(
     account = account_row(db)
     account_id, starting_cash, cash, _realized = int(account[0]), float(account[1]), float(account[2]), float(account[3])
     entry = quote.get("entry_price")
+    entry_float: float | None = None
+    try:
+        entry_float = float(entry) if entry is not None else None
+    except (TypeError, ValueError):
+        entry_float = None
     requested = float(getattr(args, "paper_size", 0.0) or 0.0)
+    shadow_only, shadow_reason = paper_buy_shadow_only_family(args, strategy_family)
     status = "skipped"
     reason = ""
     shares = 0.0
     if not token_id:
         reason = "missing_token_id"
+    elif entry_float is None or entry_float <= 0.0:
+        reason = "missing_entry_price"
+    elif entry_float < float(getattr(args, "min_entry", 0.02)):
+        reason = "entry_below_min_entry"
+    elif shadow_only:
+        reason = "strategy_family_shadow_only"
+        record_shadow_survival_gate_fill(
+            db,
+            run_id,
+            signal_id,
+            created_at,
+            m,
+            outcome,
+            token_id,
+            signal_type,
+            quote,
+            requested,
+            event_key,
+            candidate_key,
+            strategy_family,
+            shadow_reason or "strategy_family_shadow_only",
+        )
     elif paper_buy_survival_gate_disabled(args, strategy_family):
         reason = "strategy_family_survival_gate_disabled"
         record_shadow_survival_gate_fill(
@@ -2912,14 +3017,12 @@ def simulate_paper_order(
         )
     elif quote.get("execution_source") != "clob_book" or not quote.get("depth_sufficient"):
         reason = "no_executable_clob_depth"
-    elif entry is None or entry <= 0.0:
-        reason = "missing_entry_price"
     else:
         position_cap = starting_cash * float(getattr(args, "max_position_pct", 0.02))
         city_cap_remaining = starting_cash * float(getattr(args, "max_city_date_pct", 0.10)) - city_date_exposure(db, account_id, city, target_date)
         open_cap_remaining = starting_cash * float(getattr(args, "max_open_exposure_pct", 0.50)) - open_exposure(db, account_id)
         cash_cap = min(cash, position_cap, city_cap_remaining, open_cap_remaining)
-        max_affordable_shares = max(0.0, cash_cap / float(entry))
+        max_affordable_shares = max(0.0, cash_cap / entry_float)
         depth = float(quote.get("depth") or 0.0)
         shares = min(requested, depth, max_affordable_shares)
         min_fill = float(getattr(args, "min_fill_shares", 1.0))
@@ -3533,6 +3636,23 @@ def scan(args: argparse.Namespace) -> None:
                 latent_final_high_mean_f=high,
                 latent_final_high_sigma_f=args.sigma,
                 local_day_complete=local_day_complete,
+            )
+            seed_touch_watchlist_candidate(
+                db,
+                event_key=row["signal_payload"].get("event_key"),
+                market=row["market"],
+                outcome=row["outcome"],
+                token_id=row["token_id"],
+                city=row["signal_payload"].get("city"),
+                station_id=row["station_id"],
+                target_date=row["signal_payload"].get("target_date"),
+                strategy_family=row["signal_payload"].get("strategy_family") or "unknown",
+                contract_spec=row["contract_spec"],
+                observed_high_f=observed_high,
+                quote=row["quote"],
+                source_confidence=row["source_conf"],
+                timezone_name=timezone_name,
+                now_iso=now,
             )
             simulate_paper_order(
                 db,
@@ -4664,6 +4784,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--disable-ledger", action="store_true", help="Do not write simulated paper orders/fills/positions for this scan")
     s.add_argument("--allow-weak-families", action="store_true", help="Allow paper ledger fills for strategy families that have not passed the survival gate")
     s.add_argument("--strict-survival-gate", action="store_true", help="Promote-only paper fills: block INCONCLUSIVE and CONTINUE_OBSERVING families as well as killed families")
+    s.add_argument("--shadow-ladder-inconsistency", dest="shadow_ladder_inconsistency", action="store_true", default=env_bool("SHADOW_LADDER_INCONSISTENCY", True), help="Write ladder_inconsistency fills only to the counterfactual shadow ledger (default on)")
+    s.add_argument("--allow-ladder-inconsistency-official", dest="shadow_ladder_inconsistency", action="store_false", help="Permit ladder_inconsistency to mutate official paper ledger; paper-only override for experiments")
+    s.add_argument("--shadow-strategy-family", dest="shadow_strategy_families", action="append", default=[], help="Additional strategy family to write only to the shadow ledger; repeatable")
     s.set_defaults(disable_weak_families=True)
     s.add_argument("--max-position-pct", type=float, default=float(os.environ.get("MAX_POSITION_PCT", "0.02")), help="Max simulated cash exposure per market position")
     s.add_argument("--max-city-date-pct", type=float, default=float(os.environ.get("MAX_CITY_DATE_PCT", "0.10")), help="Max simulated cash exposure per city/date")
@@ -4695,7 +4818,7 @@ def build_parser() -> argparse.ArgumentParser:
     lb.add_argument("--pause", type=float, default=float(os.environ.get("LABEL_PAUSE_SECONDS", os.environ.get("SCAN_PAUSE_SECONDS", "0.05"))), help="Seconds between delayed source calls")
     lb.add_argument("--http-timeout", type=float, default=float(os.environ.get("HTTP_TIMEOUT_SECONDS", "8")), help="HTTP timeout for read-only label sources")
     lb.add_argument("--cache-ttl", type=int, default=int(os.environ.get("OBSERVATION_CACHE_TTL_SECONDS", "300")), help="In-process source cache TTL seconds")
-    lb.add_argument("--enable-ncei", dest="enable_ncei", action="store_true", default=env_bool("ENABLE_NCEI_DAILY", False), help="Use tokenless NOAA/NCEI daily summaries for final labels")
+    lb.add_argument("--enable-ncei", dest="enable_ncei", action="store_true", default=env_bool("ENABLE_NCEI_DAILY", True), help="Use tokenless NOAA/NCEI daily summaries for final labels")
     lb.add_argument("--disable-ncei", dest="enable_ncei", action="store_false", help="Disable NOAA/NCEI daily summary label attempts")
     lb.add_argument("--enable-nws", dest="enable_nws", action="store_true", default=env_bool("ENABLE_NWS", False), help="Use NWS station observations as provisional supporting evidence")
     lb.add_argument("--disable-nws", dest="enable_nws", action="store_false", help="Disable NWS provisional label attempts")
