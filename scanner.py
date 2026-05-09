@@ -723,7 +723,7 @@ def c_to_f(value: float) -> float:
 
 def detect_temperature_unit(label: str) -> str:
     text = label.lower()
-    if "°c" in text or "℃" in text or " c" in text or "celsius" in text:
+    if "°c" in text or "℃" in text or "celsius" in text or re.search(r"(?<=\d)\s*c\b", text):
         return "C"
     return "F"
 

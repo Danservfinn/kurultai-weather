@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -18,8 +19,36 @@ import weather_sources
 
 class WeatherEdgeTests(unittest.TestCase):
     def test_bucket_bounds_fahrenheit_range_not_negative(self):
-        self.assertEqual(scanner.bucket_bounds("81-82F"), (81.0, 82.0))
-        self.assertEqual(scanner.bucket_bounds("81-82°F"), (81.0, 82.0))
+        for label in ("81-82F", "81-82°F", "81–82F", "81 — 82 F", "81 to 82°F"):
+            with self.subTest(label=label):
+                self.assertEqual(scanner.bucket_bounds(label), (81.0, 82.0))
+
+    def test_bucket_bounds_open_tail_wording(self):
+        below = scanner.parse_bucket("below 81F")
+        self.assertEqual(below.kind, "open_below_strict")
+        self.assertEqual(below.high_int, 81)
+        self.assertEqual(scanner.bucket_bounds("below 81F"), (-math.inf, 80.5))
+
+        above = scanner.parse_bucket("above 82F")
+        self.assertEqual(above.kind, "open_above_strict")
+        self.assertEqual(above.low_int, 82)
+        self.assertEqual(scanner.bucket_bounds("above 82F"), (82.5, math.inf))
+
+        or_below = scanner.parse_bucket("81°F or below")
+        self.assertEqual(or_below.kind, "open_below_inclusive")
+        self.assertEqual(scanner.bucket_bounds("81°F or below"), (-math.inf, 81.5))
+
+        or_above = scanner.parse_bucket("82°F or above")
+        self.assertEqual(or_above.kind, "open_above_inclusive")
+        self.assertEqual(scanner.bucket_bounds("82°F or above"), (81.5, math.inf))
+
+    def test_bucket_bounds_celsius_range_without_degree_symbol(self):
+        bucket = scanner.parse_bucket("18-19C")
+        self.assertEqual(bucket.unit, "C")
+        self.assertEqual((bucket.low_int, bucket.high_int), (18, 19))
+        lo, hi = scanner.bucket_bounds("18-19C")
+        self.assertAlmostEqual(lo, 64.4, places=1)
+        self.assertAlmostEqual(hi, 66.2, places=1)
 
     def test_bucket_bounds_single_celsius(self):
         lo, hi = scanner.bucket_bounds("19°C")
@@ -560,6 +589,50 @@ class WeatherEdgeTests(unittest.TestCase):
             self.assertAlmostEqual(metrics["equity"], 1003.0)
             self.assertEqual(metrics["unresolved_positions"], 0)
             self.assertEqual(db.execute("select count(*) from paper_settlements").fetchone()[0], 1)
+
+    def test_init_db_migrates_old_schema_with_lifecycle_columns(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "old-paper.sqlite3")
+            old = sqlite3.connect(db_path)
+            old.executescript(
+                """
+                create table markets (
+                  market_id text primary key, title text not null, url text, first_seen text not null, last_seen text not null
+                );
+                create table signals (
+                  id integer primary key, run_id integer not null, market_id text not null, title text not null,
+                  city text, target_date text, forecast_high_f real, outcome text not null,
+                  market_prob real, model_prob real, edge real, created_at text not null
+                );
+                create table training_rows (
+                  id integer primary key, run_id integer, signal_id integer, created_at text not null,
+                  market_id text, title text, outcome text
+                );
+                create table paper_positions (
+                  id integer primary key, account_id integer not null, market_id text not null,
+                  outcome text not null, shares real not null, avg_price real not null,
+                  cost_basis real not null, status text not null, updated_at text not null
+                );
+                """
+            )
+            old.close()
+
+            db = scanner.init_db(db_path)
+            try:
+                signal_cols = {row[1] for row in db.execute("pragma table_info(signals)")}
+                training_cols = {row[1] for row in db.execute("pragma table_info(training_rows)")}
+                position_cols = {row[1] for row in db.execute("pragma table_info(paper_positions)")}
+                tables = {row[0] for row in db.execute("select name from sqlite_master where type='table'")}
+
+                for col in ("event_key", "candidate_key", "strategy_family", "settlement_state", "ladder_violation_type"):
+                    self.assertIn(col, signal_cols)
+                    self.assertIn(col, training_cols)
+                for col in ("event_key", "strategy_family"):
+                    self.assertIn(col, position_cols)
+                for table in ("events", "contract_payouts", "event_exposure_snapshots", "lifecycle_attribution", "calibration_rows"):
+                    self.assertIn(table, tables)
+            finally:
+                db.close()
 
     def test_goal_tuning_scaffold_guardrails(self):
         with tempfile.TemporaryDirectory() as td:
