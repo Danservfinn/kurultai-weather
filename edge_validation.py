@@ -17,6 +17,15 @@ KILL_OR_DISABLE = "KILL_OR_DISABLE"
 RESOLVED_TARGET = 300
 DAY_TARGET = 14
 FRESH_QUOTE_SECONDS = 900
+FAMILY_FRESH_QUOTE_SECONDS = {
+    "complement_arb": 10,
+    "latency_absorbing_state": 60,
+    "ladder_inconsistency": 120,
+    "diurnal_nowcast": 600,
+    "settlement_source_edge": 1800,
+    "forecast_distribution_directional": 3600,
+    "unknown": 300,
+}
 MIN_RESOLVED_FOR_KILL = 50
 MIN_FILLS_FOR_PROMOTION = 30
 MIN_CLOB_FILL_RATE_FOR_PROMOTION = 0.50
@@ -82,7 +91,7 @@ def brier(prob: float | None, label: float | None) -> float | None:
         return None
     return (clamp(float(prob)) - clamp(float(label))) ** 2
 
-def quote_is_fresh(row: sqlite3.Row | dict[str, Any]) -> bool:
+def quote_is_fresh(row: sqlite3.Row | dict[str, Any], family: str | None = None) -> bool:
     quote_age = get_value(row, "quote_age_seconds")
     if quote_age is None:
         return False
@@ -91,7 +100,9 @@ def quote_is_fresh(row: sqlite3.Row | dict[str, Any]) -> bool:
     except (TypeError, ValueError):
         return False
     execution_source = str(get_value(row, "execution_source", default="clob_book") or "clob_book")
-    return not bool(get_value(row, "stale_book_flag", default=0)) and age <= FRESH_QUOTE_SECONDS and execution_source == "clob_book"
+    strategy_family = family or family_of(row)
+    max_age = FAMILY_FRESH_QUOTE_SECONDS.get(strategy_family or "unknown", FAMILY_FRESH_QUOTE_SECONDS["unknown"])
+    return not bool(get_value(row, "stale_book_flag", default=0)) and age <= max_age and execution_source == "clob_book"
 
 
 def read_fills_by_candidate(db: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:

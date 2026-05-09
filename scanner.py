@@ -1767,6 +1767,77 @@ def init_db(path: str) -> sqlite3.Connection:
           label_value real, brier real, log_loss real, label_source text,
           created_at text not null
         );
+        create table if not exists touch_watchlist (
+          event_key text not null,
+          market_id text not null,
+          token_id text,
+          city text,
+          station_id text,
+          target_date text,
+          strategy_family text,
+          contract_type text,
+          threshold_f real,
+          side text,
+          current_high_f real,
+          distance_to_threshold_f real,
+          local_hour integer,
+          hotness_score real,
+          hot_reason text,
+          watch_started_at text,
+          last_source_poll_at text,
+          last_book_update_at text,
+          last_seen_ask real,
+          last_seen_bid real,
+          last_seen_depth real,
+          active integer default 1,
+          primary key(event_key, market_id, token_id)
+        );
+        create table if not exists threshold_touch_events (
+          id integer primary key,
+          event_key text not null,
+          market_id text not null,
+          token_id text,
+          city text,
+          station_id text,
+          target_date text,
+          contract_type text,
+          side text,
+          threshold_f real not null,
+          observed_high_f real not null,
+          source_provider text,
+          source_observed_at text,
+          source_fetched_at text not null,
+          scanner_detected_at text not null,
+          source_age_seconds real,
+          detection_delay_seconds real,
+          settlement_source_match integer,
+          confidence_class text,
+          raw_status text,
+          created_at text not null
+        );
+        create table if not exists post_touch_repricing (
+          id integer primary key,
+          touch_event_id integer,
+          event_key text,
+          market_id text,
+          token_id text,
+          observed_at text not null,
+          seconds_after_touch real,
+          best_bid real,
+          best_ask real,
+          spread real,
+          ask_depth real,
+          midpoint real,
+          last_trade_price real,
+          book_age_seconds real,
+          source text
+        );
+        create index if not exists idx_touch_watchlist_active on touch_watchlist(active, target_date, station_id);
+        create index if not exists idx_touch_watchlist_token on touch_watchlist(token_id, active);
+        create index if not exists idx_threshold_touch_events_event on threshold_touch_events(event_key, market_id, token_id, created_at);
+        create index if not exists idx_threshold_touch_events_detected on threshold_touch_events(scanner_detected_at);
+        create index if not exists idx_post_touch_repricing_touch on post_touch_repricing(touch_event_id, observed_at);
+        create index if not exists idx_post_touch_repricing_token on post_touch_repricing(token_id, observed_at);
         """
     )
     ensure_columns(

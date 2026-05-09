@@ -251,6 +251,25 @@ class EdgeValidationTests(unittest.TestCase):
 
         self.assertEqual(row["fresh_quote_rate"], 0.0)
 
+    def test_family_specific_quote_freshness_thresholds(self) -> None:
+        latency_row = {
+            "strategy_family": "latency_absorbing_state",
+            "quote_age_seconds": 60,
+            "stale_book_flag": 0,
+            "execution_source": "clob_book",
+        }
+        self.assertTrue(edge_validation.quote_is_fresh(latency_row))
+        self.assertFalse(edge_validation.quote_is_fresh({**latency_row, "quote_age_seconds": 61}))
+
+        arb_row = {
+            "strategy_family": "complement_arb",
+            "quote_age_seconds": 10,
+            "stale_book_flag": 0,
+            "execution_source": "clob_book",
+        }
+        self.assertTrue(edge_validation.quote_is_fresh(arb_row))
+        self.assertFalse(edge_validation.quote_is_fresh({**arb_row, "quote_age_seconds": 11}))
+
     def test_promotion_requires_real_fill_count(self) -> None:
         path = make_db()
         self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))

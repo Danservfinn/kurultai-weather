@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import edge_validation
+import latency_metrics
 import tuning_evaluator
 
 
@@ -780,6 +781,49 @@ def render_research_metrics_panel(metrics: dict[str, Any]) -> str:
         {render_table(["Event", "Mean F", "Sigma", "Observed", "Exposure", "Contracts"], event_rows, "No event exposure rows yet.")}
       </div>
       <p class="muted">Lifecycle funnel: {escape(json.dumps(funnel, sort_keys=True))}</p>
+    """
+
+
+def render_observed_high_latency_panel(metrics: dict[str, Any]) -> str:
+    bucket_rows = [
+        [escape(bucket), f'<span class="num">{escape(fmt_num(count))}</span>']
+        for bucket, count in (metrics.get("delay_buckets") or {}).items()
+    ]
+    if not metrics.get("signals"):
+        body = '<div class="empty-panel">No observed-high threshold touches recorded yet.</div>'
+    else:
+        body = f"""
+          <div class="tuning-grid compact">
+            <div>
+              <h3>Half-Life Metrics</h3>
+              <dl class="metric-list">
+                <div><dt>Touches</dt><dd>{escape(fmt_num(metrics.get("signals")))}</dd></div>
+                <div><dt>Snapshots</dt><dd>{escape(fmt_num(metrics.get("snapshots")))}</dd></div>
+                <div><dt>Ask >= .95</dt><dd>{escape(fmt_num(metrics.get("seconds_to_ask_95"), 1))}s</dd></div>
+                <div><dt>Ask >= .98</dt><dd>{escape(fmt_num(metrics.get("seconds_to_ask_98"), 1))}s</dd></div>
+              </dl>
+            </div>
+            <div>
+              <h3>Book Quality</h3>
+              <dl class="metric-list">
+                <div><dt>Avg Ask</dt><dd>{escape(fmt_price(metrics.get("avg_ask")))}</dd></div>
+                <div><dt>Avg Spread</dt><dd>{escape(fmt_price(metrics.get("avg_spread")))}</dd></div>
+                <div><dt>Quote Age</dt><dd>{escape(fmt_num(metrics.get("avg_quote_age_seconds"), 1))}s avg</dd></div>
+                <div><dt>Depth Present</dt><dd>{escape(fmt_pct(metrics.get("depth_sufficient_pct")))}</dd></div>
+              </dl>
+            </div>
+          </div>
+          {render_table(["Detection Delay", "Touches"], bucket_rows, "No detection delay buckets yet.")}
+        """
+    return f"""
+      <div class="panel-header">
+        <div>
+          <h2>Observed-High Latency Half-Life</h2>
+          <p>Threshold-touch detection and post-touch public-book repricing snapshots.</p>
+        </div>
+        {status_pill("paper-only")}
+      </div>
+      {body}
     """
 
 
@@ -1813,6 +1857,7 @@ def build_snapshot(
     progress = evaluation_progress(db)
     label_progress = labeling_progress(db)
     research = research_metrics(db)
+    observed_high_latency = latency_metrics.aggregate_latency_metrics(db)
     tuning_state = tuning_evaluator.evaluate_tuning_state(db_path=db_path)
     survival_rows = edge_validation.evaluate_strategy_families(db_path=db_path, persist=False)
     tuning_iterations = tuning_evaluator.load_tuning_iterations(iteration_log_path)
@@ -1988,6 +2033,7 @@ def build_snapshot(
         "equity_chart": equity_svg(snapshot_rows, float(metrics["starting_cash"])),
         "labeling_settlement_panel": render_labeling_settlement_panel(label_progress),
         "research_metrics_panel": render_research_metrics_panel(research),
+        "observed_high_latency_panel": render_observed_high_latency_panel(observed_high_latency),
         "tuning_section": render_tuning_section(tuning_state, metrics, progress),
         "strategy_family_survival_panel": render_strategy_family_survival_panel(survival_rows),
         "tuning_iterations_section": render_tuning_iterations_section(tuning_iterations, iteration_log_path),
@@ -2031,6 +2077,7 @@ def build_snapshot(
         "progress": dict(progress),
         "labeling_settlement": dict(label_progress),
         "research_metrics": research,
+        "observed_high_latency": observed_high_latency,
         "strategy_family_survival": {
             "rows": survival_rows,
             "thresholds": {
@@ -2155,6 +2202,10 @@ def build_html_from_snapshot(snapshot: dict[str, Any]) -> str:
 
   <section class="panel table-section" aria-label="Research metrics" data-live-fragment="research_metrics_panel">
     {fragments["research_metrics_panel"]}
+  </section>
+
+  <section class="panel table-section" aria-label="Observed-high latency half-life" data-live-fragment="observed_high_latency_panel">
+    {fragments["observed_high_latency_panel"]}
   </section>
 
   <section class="panel table-section" aria-label="Tuning readiness and performance traces" data-live-fragment="tuning_section">
