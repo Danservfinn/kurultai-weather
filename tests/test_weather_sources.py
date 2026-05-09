@@ -56,6 +56,35 @@ class WeatherSourceAdapterTests(unittest.TestCase):
         self.assertIn("dataset=daily-summaries", ncei_url)
         self.assertNotIn("token", ncei_url.lower())
 
+    def test_ncei_and_iem_daily_high_parsers(self):
+        ncei_high = weather_sources.parse_ncei_daily_high_f(
+            [{"DATE": "2026-05-09", "STATION": "GHCND:USW00003017", "TMAX": "83.0"}]
+        )
+        iem_high = weather_sources.parse_iem_asos_daily_high_f(
+            "station,valid,tmpf\nKDEN,2026-05-09 12:00,79.0\nKDEN,2026-05-09 20:00,84.2\n"
+        )
+
+        self.assertEqual(ncei_high, 83.0)
+        self.assertEqual(iem_high, 84.2)
+
+    def test_nws_daily_high_parser_from_mocked_observations(self):
+        def fake_fetch(url, headers, timeout):
+            return json.dumps(
+                {
+                    "features": [
+                        {"properties": {"temperature": {"value": 20.0}}},
+                        {"properties": {"temperature": {"value": 25.0}}},
+                    ]
+                }
+            )
+
+        adapter = weather_sources.NWSAdapter(enabled=True, fetch_text=fake_fetch)
+        record = adapter.fetch_daily_high("KDEN", "2026-05-09")
+
+        self.assertEqual(record.status, "ok")
+        self.assertAlmostEqual(record.data["daily_high_f"], 77.0)
+        self.assertTrue(record.provenance["read_only"])
+
     def test_meteostat_and_commercial_adapters_are_graceful_stubs(self):
         meteostat = weather_sources.MeteostatAdapter(enabled=False).dependency_record()
         commercial = weather_sources.CommercialWeatherAdapter("tomorrow_io", enabled=False).fetch_stub()

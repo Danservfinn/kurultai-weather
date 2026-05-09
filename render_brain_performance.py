@@ -31,7 +31,7 @@ EVIDENCE_CANDIDATE_TARGET = 300
 EVALUATION_EDGE_THRESHOLD = 0.08
 EVALUATION_MIN_ENTRY = 0.02
 EVALUATION_MAX_ENTRY = 0.95
-SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 3
 POLL_INTERVAL_MS = int(float(os.environ.get("DASHBOARD_POLL_SECONDS", "30")) * 1000)
 
 
@@ -117,6 +117,11 @@ def script_json(data: Any) -> str:
     return json.dumps(data, sort_keys=True, separators=(",", ":")).replace("</", "<\\/")
 
 
+def table_exists(db: sqlite3.Connection, table: str) -> bool:
+    row = db.execute("select 1 from sqlite_master where type='table' and name=?", (table,)).fetchone()
+    return bool(row)
+
+
 def table_count(db: sqlite3.Connection, table: str) -> int:
     allowed = {
         "runs",
@@ -131,9 +136,12 @@ def table_count(db: sqlite3.Connection, table: str) -> int:
         "paper_fills",
         "paper_positions",
         "paper_settlements",
+        "label_attempts",
     }
     if table not in allowed:
         raise ValueError(f"unexpected table name: {table}")
+    if not table_exists(db, table):
+        return 0
     row = db.execute(f"select count(*) from {table}").fetchone()
     return int(row[0] or 0)
 
@@ -274,6 +282,126 @@ def evaluation_progress(db: sqlite3.Connection) -> dict[str, Any]:
         "candidate_target": EVIDENCE_CANDIDATE_TARGET,
         "day_target": EVIDENCE_DAY_TARGET,
         "ready": len(rows) >= EVIDENCE_CANDIDATE_TARGET and sample_days >= EVIDENCE_DAY_TARGET,
+    }
+
+
+def labeling_progress(db: sqlite3.Connection) -> dict[str, Any]:
+    final_where = tuning_evaluator.FINAL_LABEL_WHERE
+    training_rows = table_count(db, "training_rows")
+    labeled_rows = int(db.execute(f"select count(*) from training_rows where {final_where}").fetchone()[0] or 0)
+    pending_rows = int(
+        db.execute(
+            """
+            select count(*)
+            from training_rows
+            where target_date is not null
+              and target_date <> ''
+              and target_date <= date('now')
+              and coalesce(label_status,'') <> 'final'
+            """
+        ).fetchone()[0]
+        or 0
+    )
+    future_rows = int(
+        db.execute(
+            """
+            select count(*)
+            from training_rows
+            where target_date is not null
+              and target_date <> ''
+              and target_date > date('now')
+              and coalesce(label_status,'') <> 'final'
+            """
+        ).fetchone()[0]
+        or 0
+    )
+    open_positions = int(db.execute("select count(*) from paper_positions where status='open'").fetchone()[0] or 0)
+    settled_positions = int(db.execute("select count(*) from paper_positions where status='settled'").fetchone()[0] or 0)
+    settlement_rows = table_count(db, "paper_settlements")
+    attempt_rows = table_count(db, "label_attempts")
+    if not table_exists(db, "label_attempts"):
+        return {
+            "training_rows": training_rows,
+            "labeled_rows": labeled_rows,
+            "pending_rows": pending_rows,
+            "future_rows": future_rows,
+            "open_positions": open_positions,
+            "settled_positions": settled_positions,
+            "settlements": settlement_rows,
+            "attempts": 0,
+            "attempt_status_counts": {},
+            "source_coverage": [],
+            "recent_attempts": [],
+            "blockers": [{"reason": "label_attempts table has not been created yet", "count": pending_rows}] if pending_rows else [],
+        }
+    attempt_status_counts = {
+        str(row["outcome_status"] or "unknown"): int(row["count"] or 0)
+        for row in db.execute(
+            """
+            select coalesce(outcome_status, 'unknown') as outcome_status, count(*) as count
+            from label_attempts
+            group by coalesce(outcome_status, 'unknown')
+            """
+        ).fetchall()
+    }
+    source_coverage = [
+        row_dict(row)
+        for row in db.execute(
+            """
+            select
+              coalesce(source_provider, 'unknown') as source_provider,
+              coalesce(outcome_status, 'unknown') as outcome_status,
+              count(*) as count,
+              max(attempted_at) as latest_attempt
+            from label_attempts
+            group by coalesce(source_provider, 'unknown'), coalesce(outcome_status, 'unknown')
+            order by count desc, source_provider
+            limit 12
+            """
+        ).fetchall()
+    ]
+    recent_attempts = [
+        row_dict(row)
+        for row in db.execute(
+            """
+            select
+              id, attempted_at, source_provider, source_status, outcome_status,
+              station_id, final_high_f, label_value, reason, title, outcome
+            from label_attempts
+            order by id desc
+            limit 10
+            """
+        ).fetchall()
+    ]
+    blockers = [
+        row_dict(row)
+        for row in db.execute(
+            """
+            select coalesce(reason, outcome_status, 'unknown') as reason, count(*) as count
+            from label_attempts
+            where outcome_status in ('pending', 'skipped', 'error')
+            group by coalesce(reason, outcome_status, 'unknown')
+            order by count desc, reason
+            limit 8
+            """
+        ).fetchall()
+    ]
+    if not blockers and pending_rows:
+        blockers = [{"reason": "No delayed label attempts recorded for pending rows", "count": pending_rows}]
+
+    return {
+        "training_rows": training_rows,
+        "labeled_rows": labeled_rows,
+        "pending_rows": pending_rows,
+        "future_rows": future_rows,
+        "open_positions": open_positions,
+        "settled_positions": settled_positions,
+        "settlements": settlement_rows,
+        "attempts": attempt_rows,
+        "attempt_status_counts": attempt_status_counts,
+        "source_coverage": source_coverage,
+        "recent_attempts": recent_attempts,
+        "blockers": blockers,
     }
 
 
@@ -608,6 +736,84 @@ def render_source_feature_tuning_panel(tuning_state: dict[str, Any]) -> str:
     """
 
 
+def render_labeling_settlement_panel(progress: dict[str, Any]) -> str:
+    status_counts = progress.get("attempt_status_counts") or {}
+    coverage_rows = [
+        [
+            escape(row.get("source_provider")),
+            status_pill(row.get("outcome_status")),
+            f'<span class="num">{escape(fmt_num(row.get("count")))}</span>',
+            escape(row.get("latest_attempt") or "-"),
+        ]
+        for row in (progress.get("source_coverage") or [])
+    ]
+    attempt_rows = [
+        [
+            f'<span class="num">{escape(row.get("id"))}</span><br><span class="muted">{escape(row.get("attempted_at"))}</span>',
+            escape(row.get("source_provider")),
+            status_pill(row.get("outcome_status")),
+            status_pill(row.get("source_status")),
+            f'<span class="num">{escape(fmt_num(row.get("final_high_f"), 1))}</span>',
+            f'<span class="num">{escape(fmt_price(row.get("label_value")))}</span>',
+            escape(row.get("station_id")),
+            f'<span class="title-cell">{escape(row.get("title"))}</span><br><span class="muted">{escape(row.get("outcome"))}</span>',
+            escape(row.get("reason")),
+        ]
+        for row in (progress.get("recent_attempts") or [])
+    ]
+    blocker_rows = [
+        [escape(row.get("reason")), f'<span class="num">{escape(fmt_num(row.get("count")))}</span>']
+        for row in (progress.get("blockers") or [])
+    ]
+    return f"""
+      <div class="panel-header">
+        <div>
+          <h2>Labeling and Settlement Progress</h2>
+          <p>Delayed outcome labels stay separate from decision-time feature snapshots and drive paper-only settlement.</p>
+        </div>
+        {status_pill("labeler")}
+      </div>
+      <div class="tuning-banner" aria-label="Labeling safety status">
+        <strong>Read-only labels</strong>
+        <span>Final rows require delayed label evidence; provisional source attempts do not settle positions or unlock live trading.</span>
+      </div>
+      <div class="tuning-grid compact">
+        <div>
+          <h3>Progress</h3>
+          <dl class="metric-list">
+            <div><dt>Labeled Rows</dt><dd>{escape(fmt_num(progress.get("labeled_rows")))} / {escape(fmt_num(progress.get("training_rows")))}</dd></div>
+            <div><dt>Pending Rows</dt><dd>{escape(fmt_num(progress.get("pending_rows")))}</dd></div>
+            <div><dt>Future Rows</dt><dd>{escape(fmt_num(progress.get("future_rows")))}</dd></div>
+            <div><dt>Attempts</dt><dd>{escape(fmt_num(progress.get("attempts")))}</dd></div>
+          </dl>
+        </div>
+        <div>
+          <h3>Paper Settlement</h3>
+          <dl class="metric-list">
+            <div><dt>Open Positions</dt><dd>{escape(fmt_num(progress.get("open_positions")))}</dd></div>
+            <div><dt>Settled Positions</dt><dd>{escape(fmt_num(progress.get("settled_positions")))}</dd></div>
+            <div><dt>Settlement Rows</dt><dd>{escape(fmt_num(progress.get("settlements")))}</dd></div>
+            <div><dt>Attempt Status</dt><dd>final {escape(fmt_num(status_counts.get("final", 0)))}, provisional {escape(fmt_num(status_counts.get("provisional", 0)))}, pending {escape(fmt_num(status_counts.get("pending", 0)))}</dd></div>
+          </dl>
+        </div>
+      </div>
+      <div class="split">
+        <div>
+          <h3>Source Coverage</h3>
+          {render_table(["Source", "Status", "Attempts", "Latest"], coverage_rows, "No label attempts recorded yet.")}
+        </div>
+        <div>
+          <h3>Blockers</h3>
+          {render_table(["Reason", "Rows"], blocker_rows, "No current label blockers recorded.")}
+        </div>
+      </div>
+      <div class="table-section">
+        <h3>Recent Label Attempts</h3>
+        {render_table(["Attempt", "Source", "Outcome", "Fetch", "High F", "Label", "Station", "Market", "Reason"], attempt_rows, "No delayed label attempts recorded yet.")}
+      </div>
+    """
+
+
 def render_tuning_section(tuning_state: dict[str, Any], metrics: dict[str, Any], progress: dict[str, Any]) -> str:
     status = str(tuning_state.get("status") or "scaffold_only")
     evidence = tuning_state.get("evidence") or {}
@@ -717,6 +923,7 @@ def render_tuning_iterations_section(iterations: Sequence[dict[str, Any]], itera
         gates = record.get("gates") or []
         metrics = record.get("available_performance_metrics") or {}
         approval = record.get("approval") or {}
+        labeling = record.get("labeling") or {}
         ready_gates = sum(1 for gate in gates if gate.get("ready"))
         evidence_summary = (
             f"training {fmt_num(evidence.get('training_rows'))}; "
@@ -728,7 +935,9 @@ def render_tuning_iterations_section(iterations: Sequence[dict[str, Any]], itera
             f"return {fmt_pct(metrics.get('return_pct'), signed=True)}; "
             f"drawdown {fmt_pct(metrics.get('drawdown'))}; "
             f"brier {fmt_num(metrics.get('brier_score'), 3)}; "
-            f"unresolved {fmt_pct(metrics.get('unresolved_rate'))}"
+            f"unresolved {fmt_pct(metrics.get('unresolved_rate'))}; "
+            f"labels={'yes' if labeling.get('labels_available') else 'no'}; "
+            f"settlements {fmt_num(labeling.get('paper_settlements') if labeling else metrics.get('paper_settlements'))}"
         )
         approval_summary = (
             f"{record.get('approval_status') or 'not-approved'}; "
@@ -1183,6 +1392,7 @@ def build_snapshot(
     generated_at = utc_now_iso()
     metrics = portfolio_metrics(db)
     progress = evaluation_progress(db)
+    label_progress = labeling_progress(db)
     tuning_state = tuning_evaluator.evaluate_tuning_state(db_path=db_path)
     tuning_iterations = tuning_evaluator.load_tuning_iterations(iteration_log_path)
     if not tuning_iterations:
@@ -1201,6 +1411,7 @@ def build_snapshot(
         "orders": table_count(db, "paper_orders"),
         "fills": table_count(db, "paper_fills"),
         "positions": table_count(db, "paper_positions"),
+        "label attempts": table_count(db, "label_attempts"),
     }
     expanded_counts = {
         "runs": table_count(db, "runs"),
@@ -1349,6 +1560,7 @@ def build_snapshot(
         "count_cards": "".join(count_cards),
         "evidence_progress": evidence_progress,
         "equity_chart": equity_svg(snapshot_rows, float(metrics["starting_cash"])),
+        "labeling_settlement_panel": render_labeling_settlement_panel(label_progress),
         "tuning_section": render_tuning_section(tuning_state, metrics, progress),
         "tuning_iterations_section": render_tuning_iterations_section(tuning_iterations, iteration_log_path),
         "data_sources_feature_tuning_panel": render_source_feature_tuning_panel(tuning_state),
@@ -1389,6 +1601,7 @@ def build_snapshot(
         },
         "metrics": dict(metrics),
         "progress": dict(progress),
+        "labeling_settlement": dict(label_progress),
         "tuning_performance": {
             "state": tuning_state,
             "current_metrics": {
@@ -1497,6 +1710,10 @@ def build_html_from_snapshot(snapshot: dict[str, Any]) -> str:
       </div>
       <div data-live-fragment="equity_chart">{fragments["equity_chart"]}</div>
     </article>
+  </section>
+
+  <section class="panel table-section" aria-label="Labeling and settlement progress" data-live-fragment="labeling_settlement_panel">
+    {fragments["labeling_settlement_panel"]}
   </section>
 
   <section class="panel table-section" aria-label="Tuning readiness and performance traces" data-live-fragment="tuning_section">

@@ -22,6 +22,7 @@ This repo is paper-only research tooling.
 - Render local HTML/JSON dashboards.
 - Append proposal-only tuning iteration JSONL records.
 - Propose config changes after paper-forward gates pass, without applying them automatically.
+- Fetch delayed public weather labels and settle simulated paper positions to $1/$0 outcomes.
 
 ## Guardrails in Code
 
@@ -29,6 +30,7 @@ This repo is paper-only research tooling.
 - [goals/paper_weather_edge_v1.yaml](../goals/paper_weather_edge_v1.yaml) requires paper-only guardrails and `promotion: propose_only`.
 - [tuning_evaluator.py](../tuning_evaluator.py) reports safety flags and sanitizes loaded tuning iteration logs so unsafe records are marked rejected.
 - [render_brain_performance.py](../render_brain_performance.py) displays safety labels and does not expose execution controls.
+- [scanner.py](../scanner.py) keeps delayed labels in `training_rows.label_*` and `label_attempts`, separate from no-lookahead `features_json`.
 
 ## Review Rule
 

@@ -19,6 +19,7 @@ GOAL_PATH = os.path.join(ROOT, "goals", "paper_weather_edge_v1.yaml")
 RUNTIME_TUNABLES_PATH = os.path.join(ROOT, "runtime_tunables.env")
 TUNING_ITERATIONS_PATH = os.path.join(ROOT, "tuning_iterations.jsonl")
 ITERATION_SCHEMA_VERSION = 1
+FINAL_LABEL_WHERE = "label_status='final' and label_value in (0, 1)"
 
 
 TUNABLE_ENV_NAMES = {
@@ -239,6 +240,8 @@ def count_rows(db: sqlite3.Connection, table: str, where: str = "1=1") -> int:
         "paper_orders",
         "paper_fills",
         "paper_positions",
+        "paper_settlements",
+        "label_attempts",
     }
     if table not in allowed:
         raise ValueError(f"unexpected table name: {table}")
@@ -302,7 +305,8 @@ def source_specific_count(db: sqlite3.Connection, family: dict[str, Any]) -> int
         )
     if family.get("label_source") and column_exists(db, table, "label_source"):
         needle = str(family["label_source"]).lower()
-        return count_rows(db, table, f"lower(coalesce(label_source,'')) like '%{needle}%'")
+        status_filter = f" and {FINAL_LABEL_WHERE}" if table == "training_rows" and column_exists(db, table, "label_status") else ""
+        return count_rows(db, table, f"lower(coalesce(label_source,'')) like '%{needle}%'{status_filter}")
     return count_rows(db, table)
 
 
@@ -438,6 +442,9 @@ def available_performance_metrics(db: sqlite3.Connection | None) -> dict[str, An
             "training_rows": 0,
             "labeled_rows": 0,
             "paper_buy_rows": 0,
+            "open_positions": 0,
+            "settled_positions": 0,
+            "paper_settlements": 0,
             "avg_edge": None,
             "paper_buy_avg_edge": None,
             "brier_score": None,
@@ -457,8 +464,11 @@ def available_performance_metrics(db: sqlite3.Connection | None) -> dict[str, An
         ).fetchone()
 
     training_rows = count_rows(db, "training_rows")
-    labeled_rows = count_rows(db, "training_rows", "label_status is not null and label_status <> ''")
+    labeled_rows = count_rows(db, "training_rows", FINAL_LABEL_WHERE)
     paper_buy_rows = count_rows(db, "training_rows", "coalesce(signal_type,'') like 'paper_buy%'")
+    open_positions = count_rows(db, "paper_positions", "status='open'")
+    settled_positions = count_rows(db, "paper_positions", "status='settled'")
+    paper_settlements = count_rows(db, "paper_settlements")
     avg_edge = paper_buy_avg_edge = brier_score = None
     if table_exists(db, "training_rows"):
         avg_edge = db.execute("select avg(edge) from training_rows where edge is not null").fetchone()[0]
@@ -494,6 +504,9 @@ def available_performance_metrics(db: sqlite3.Connection | None) -> dict[str, An
         "training_rows": training_rows,
         "labeled_rows": labeled_rows,
         "paper_buy_rows": paper_buy_rows,
+        "open_positions": open_positions,
+        "settled_positions": settled_positions,
+        "paper_settlements": paper_settlements,
         "avg_edge": float(avg_edge) if avg_edge is not None else None,
         "paper_buy_avg_edge": float(paper_buy_avg_edge) if paper_buy_avg_edge is not None else None,
         "brier_score": float(brier_score) if brier_score is not None else None,
@@ -600,7 +613,7 @@ def evaluate_tuning_state(
         with sqlite3.connect(uri, uri=True) as db:
             db.row_factory = sqlite3.Row
             training_rows = count_rows(db, "training_rows")
-            labeled_rows = count_rows(db, "training_rows", "label_status is not null and label_status <> ''")
+            labeled_rows = count_rows(db, "training_rows", FINAL_LABEL_WHERE)
             paper_buy_rows = count_rows(db, "training_rows", "coalesce(signal_type,'') like 'paper_buy%'")
             snapshot_rows = count_rows(db, "paper_account_snapshots")
             span = calendar_days(db)
@@ -780,6 +793,8 @@ def build_tuning_iteration_record(
     ts = timestamp or utc_now_iso()
     seq = 0 if sequence is None else sequence
     post_labels = state.get("post_labels") or {}
+    evidence = dict(state.get("evidence") or {})
+    performance = dict(state.get("available_performance_metrics") or {})
     safety = {
         "paper_only": True,
         "wallet": False,
@@ -806,12 +821,19 @@ def build_tuning_iteration_record(
             "order_placement": False,
             "live_money_deployment": False,
         },
-        "evidence_counts": dict(state.get("evidence") or {}),
+        "evidence_counts": evidence,
         "gates": list(state.get("gates") or []),
         "target_metrics": dict(state.get("target_metrics") or {}),
         "current_tunables": dict(state.get("current_tunables") or {}),
         "proposed_tunables": dict(state.get("proposed_tunables") or {}),
-        "available_performance_metrics": dict(state.get("available_performance_metrics") or {}),
+        "available_performance_metrics": performance,
+        "labeling": {
+            "labels_available": int(evidence.get("labeled_rows") or 0) > 0,
+            "labeled_rows": int(evidence.get("labeled_rows") or 0),
+            "paper_settlements": int(performance.get("paper_settlements") or 0),
+            "settled_positions": int(performance.get("settled_positions") or 0),
+            "open_positions": int(performance.get("open_positions") or 0),
+        },
         "blocked_reasons": list(state.get("blocked_reasons") or []),
         "guardrails_ok": bool(state.get("guardrails_ok")),
         "safety": safety,

@@ -10,6 +10,7 @@ secrets, signs requests, or requires credentials by default.
 from __future__ import annotations
 
 import datetime as dt
+import csv
 import importlib.util
 import json
 import os
@@ -206,6 +207,14 @@ class NWSAdapter(ReadOnlyWeatherAdapter):
     def latest_observation_url(station_id: str) -> str:
         return f"https://api.weather.gov/stations/{urllib.parse.quote(station_id.upper())}/observations/latest"
 
+    @staticmethod
+    def observations_url(station_id: str, start: dt.datetime, end: dt.datetime) -> str:
+        params = {
+            "start": start.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "end": end.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        return f"https://api.weather.gov/stations/{urllib.parse.quote(station_id.upper())}/observations?{urllib.parse.urlencode(params)}"
+
     def fetch_points(self, lat: float, lon: float) -> SourceRecord:
         return self._fetch_json(self.points_url(lat, lon), accept="application/geo+json,application/json")
 
@@ -222,6 +231,48 @@ class NWSAdapter(ReadOnlyWeatherAdapter):
             "temperature_f": c_to_f(float(temp_c)) if temp_c is not None else None,
             "raw": record.data,
         }
+        return record
+
+    def fetch_daily_high(self, station_id: str, date: str) -> SourceRecord:
+        try:
+            day = dt.date.fromisoformat(date[:10])
+        except ValueError:
+            return SourceRecord(
+                provider=self.config.provider,
+                family=self.family,
+                status="error",
+                fetched_at=utc_now_iso(),
+                provenance=self.provenance(None, station_id=station_id, date=date),
+                error="invalid_date",
+            )
+        start = dt.datetime.combine(day, dt.time(0, 0), tzinfo=dt.timezone.utc)
+        end = start + dt.timedelta(days=1)
+        record = self._fetch_json(self.observations_url(station_id, start, end), accept="application/geo+json,application/json")
+        if record.status != "ok":
+            return record
+        features = record.data.get("features") if isinstance(record.data.get("features"), list) else []
+        highs: list[float] = []
+        for feature in features:
+            props = feature.get("properties") if isinstance(feature, dict) else None
+            if not isinstance(props, dict):
+                continue
+            temp = props.get("temperature") if isinstance(props.get("temperature"), dict) else {}
+            value = temp.get("value")
+            if value is None:
+                continue
+            try:
+                highs.append(c_to_f(float(value)))
+            except (TypeError, ValueError):
+                continue
+        high = max(highs) if highs else None
+        record.data = {
+            "station_id": station_id.upper(),
+            "date": day.isoformat(),
+            "daily_high_f": high,
+            "observation_count": len(highs),
+            "raw": record.data,
+        }
+        record.status = "ok" if high is not None else "missing_daily_high"
         return record
 
     def forecast_metadata(self, points_record: SourceRecord) -> dict[str, Any]:
@@ -295,6 +346,34 @@ class IEMMetarAdapter(ReadOnlyWeatherAdapter):
             ("report_type", "2"),
         ]
         return f"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?{urllib.parse.urlencode(params)}"
+
+    def fetch_daily_high(self, station_id: str, date: str, tz: str = "UTC") -> SourceRecord:
+        try:
+            day = dt.date.fromisoformat(date[:10])
+        except ValueError:
+            return SourceRecord(
+                provider=self.config.provider,
+                family=self.family,
+                status="error",
+                fetched_at=utc_now_iso(),
+                provenance=self.provenance(None, station_id=station_id, date=date),
+                error="invalid_date",
+            )
+        start = dt.datetime.combine(day, dt.time(0, 0), tzinfo=dt.timezone.utc)
+        end = start + dt.timedelta(days=1)
+        record = self._fetch_json(self.asos_url(station_id, start, end, tz=tz), accept="text/plain,text/csv")
+        if record.status != "ok":
+            return record
+        raw = str(record.data.get("raw_text") or "")
+        high = parse_iem_asos_daily_high_f(raw)
+        record.data = {
+            "station_id": station_id.upper(),
+            "date": day.isoformat(),
+            "daily_high_f": high,
+            "raw_excerpt": bounded_excerpt(raw),
+        }
+        record.status = "ok" if high is not None else "missing_daily_high"
+        return record
 
 
 def parse_metar_report(item: Any) -> dict[str, Any]:
@@ -373,6 +452,15 @@ class NOAADelayedLabelAdapter(ReadOnlyWeatherAdapter):
         record = self._fetch_json(self.ncei_daily_url(station_id, date))
         record.provenance["offline_or_daily"] = True
         record.provenance["optional_cdo_token_configured"] = bool(os.environ.get(self.token_env))
+        if record.status == "ok":
+            high = parse_ncei_daily_high_f(record.data)
+            record.data = {
+                "station_id": station_id,
+                "date": date,
+                "daily_high_f": high,
+                "raw": record.data,
+            }
+            record.status = "ok" if high is not None else "missing_daily_high"
         return record
 
 
@@ -510,3 +598,66 @@ def adapter_catalog(runtime: dict[str, Any] | None = None) -> list[SourceRecord]
         MeteostatAdapter(enabled=boolish(runtime.get("enable_meteostat"))).dependency_record(),
         CommercialWeatherAdapter("commercial_weather", enabled=boolish(runtime.get("allow_paid_provider_features"))).fetch_stub(),
     ]
+
+
+def parse_ncei_daily_high_f(data: Any) -> float | None:
+    """Extract a Fahrenheit daily high from NOAA/NCEI daily summary payloads."""
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        rows = data["results"]
+    elif isinstance(data, dict) and isinstance(data.get("items"), list):
+        rows = data["items"]
+    elif isinstance(data, list):
+        rows = data
+    else:
+        rows = [data] if isinstance(data, dict) else []
+
+    field_names = (
+        "TMAX",
+        "tmax",
+        "DailyMaximumDryBulbTemperature",
+        "dailyMaximumDryBulbTemperature",
+        "temperature_max",
+        "temperatureMaximum",
+        "MAX_TEMP",
+    )
+    values: list[float] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for field in field_names:
+            raw = row.get(field)
+            if raw in (None, "", "M"):
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if -100.0 <= value <= 170.0:
+                values.append(value)
+    return max(values) if values else None
+
+
+def parse_iem_asos_daily_high_f(raw_csv: str) -> float | None:
+    """Extract a daily high from IEM ASOS CSV text without assuming network."""
+    text = (raw_csv or "").strip()
+    if not text:
+        return None
+    lines = [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
+    if not lines:
+        return None
+    values: list[float] = []
+    try:
+        reader = csv.DictReader(lines)
+        for row in reader:
+            raw = row.get("tmpf") or row.get("temperature") or row.get("temp_f")
+            if raw in (None, "", "M"):
+                continue
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if -100.0 <= value <= 170.0:
+                values.append(value)
+    except csv.Error:
+        return None
+    return max(values) if values else None

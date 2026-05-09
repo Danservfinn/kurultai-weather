@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import features
 import tuning_evaluator
+import weather_sources
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(ROOT, "paper_weather.sqlite3")
@@ -43,6 +44,18 @@ DEFAULT_ACCOUNT_NAME = "default-paper"
 DEFAULT_BANKROLL_USD = 1000.0
 RAW_EXCERPT_LIMIT = 4000
 RAW_JSON_LIMIT = 20000
+FINAL_LABEL_STATUS = "final"
+PROVISIONAL_LABEL_STATUS = "provisional"
+PENDING_LABEL_STATUS = "pending"
+SKIPPED_LABEL_STATUS = "skipped"
+ERROR_LABEL_STATUS = "error"
+LABEL_OUTCOME_STATUSES = {
+    FINAL_LABEL_STATUS,
+    PROVISIONAL_LABEL_STATUS,
+    PENDING_LABEL_STATUS,
+    SKIPPED_LABEL_STATUS,
+    ERROR_LABEL_STATUS,
+}
 TRAINING_EXPORT_COLUMNS = [
     "id",
     "created_at",
@@ -195,6 +208,14 @@ STATION_REGISTRY = {
     "austin": {"station_id": "KAUS", "station_name": "Austin-Bergstrom Airport", "timezone": "America/Chicago", "source_reliability": "medium"},
     "paris": {"station_id": "LFPG", "station_name": "Paris Charles de Gaulle Airport", "timezone": "Europe/Paris", "source_reliability": "medium"},
     "tokyo": {"station_id": "RJTT", "station_name": "Tokyo Haneda Airport", "timezone": "Asia/Tokyo", "source_reliability": "medium"},
+}
+NCEI_STATION_ID_CROSSWALK = {
+    "KAUS": "GHCND:USW00013958",
+    "KDEN": "GHCND:USW00003017",
+    "KLAX": "GHCND:USW00023174",
+    "KLGA": "GHCND:USW00014732",
+    "KMIA": "GHCND:USW00012839",
+    "KORD": "GHCND:USW00094846",
 }
 
 
@@ -1320,6 +1341,15 @@ def init_db(path: str) -> sqlite3.Connection:
           signal_type text, reason text, features_json text, label_status text,
           label_value real, label_source text, labeled_at text
         );
+        create table if not exists label_attempts (
+          id integer primary key, attempted_at text not null, training_row_id integer,
+          position_id integer, market_id text, title text, outcome text,
+          target_date text, station_id text, source_provider text not null,
+          source_family text, source_url text, source_status text,
+          station_confidence text, final_high_f real, threshold_low_f real,
+          threshold_high_f real, label_value real, outcome_status text not null,
+          reason text, provenance_json text, raw_excerpt text
+        );
         create table if not exists paper_accounts (
           id integer primary key, name text not null unique, starting_cash real not null,
           cash real not null, realized_pnl real not null default 0,
@@ -1408,6 +1438,45 @@ def init_db(path: str) -> sqlite3.Connection:
             "orderbook_snapshot_id": "integer",
             "depth_near_ask": "real",
             "depth_sufficient": "integer",
+        },
+    )
+    ensure_columns(
+        db,
+        "training_rows",
+        {
+            "label_status": "text",
+            "label_value": "real",
+            "label_source": "text",
+            "labeled_at": "text",
+        },
+    )
+    ensure_columns(
+        db,
+        "label_attempts",
+        {
+            "position_id": "integer",
+            "source_family": "text",
+            "source_url": "text",
+            "source_status": "text",
+            "station_confidence": "text",
+            "final_high_f": "real",
+            "threshold_low_f": "real",
+            "threshold_high_f": "real",
+            "label_value": "real",
+            "outcome_status": "text",
+            "reason": "text",
+            "provenance_json": "text",
+            "raw_excerpt": "text",
+        },
+    )
+    ensure_columns(
+        db,
+        "paper_settlements",
+        {
+            "source_training_row_id": "integer",
+            "label_attempt_id": "integer",
+            "label_source": "text",
+            "final_high_f": "real",
         },
     )
     seed_station_registry(db)
@@ -2284,6 +2353,7 @@ def scan(args: argparse.Namespace) -> None:
             signal_count += 1
     db.execute("update runs set markets_seen=?, signals_seen=? where id=?", (len(markets), signal_count, run_id))
     settle_paper_positions_from_latest_prices(db, now)
+    settle_paper_positions_from_labels(db, now)
     record_account_snapshot(db, run_id, now)
     db.commit()
     render_report(db, args.report)
@@ -2419,7 +2489,552 @@ def mark_pnl(entry_prob: float, latest_prob: float, edge: float) -> tuple[float,
         mark = latest_prob
     if edge >= 0.0:
         return mark - entry_prob, token_status
-    return entry_prob - mark, reverse_resolution(token_status)
+        return entry_prob - mark, reverse_resolution(token_status)
+
+
+def finite_or_none(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def outcome_bucket_for_label(title: str | None, outcome: str | None) -> tuple[BucketSpec | None, bool]:
+    normalized = str(outcome or "").strip().lower()
+    is_no_token = normalized in {"no", "n"}
+    if normalized in {"yes", "y", "no", "n"}:
+        return parse_bucket(str(title or "")), is_no_token
+    return parse_bucket(str(outcome or "")) or parse_bucket(str(title or "")), False
+
+
+def determine_label_value(final_high_f: float, title: str | None, outcome: str | None) -> tuple[float | None, BucketSpec | None, str]:
+    bucket, is_no_token = outcome_bucket_for_label(title, outcome)
+    if bucket is None:
+        return None, None, "bucket_unparseable"
+    in_bucket = high_within_bucket(final_high_f, bucket)
+    value = 0.0 if (is_no_token and in_bucket) else 1.0 if (is_no_token or in_bucket) else 0.0
+    return value, bucket, "ok"
+
+
+def ncei_station_identifiers(station_id: str | None) -> list[str]:
+    if not station_id:
+        return []
+    raw = str(station_id).strip()
+    if not raw:
+        return []
+    upper = raw.upper()
+    candidates = [NCEI_STATION_ID_CROSSWALK.get(upper), upper]
+    if upper.startswith("GHCND:"):
+        candidates.append(upper.removeprefix("GHCND:"))
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+def label_station_confidence(candidate: dict[str, Any], provider: str, outcome_status: str) -> str:
+    if not candidate.get("station_id"):
+        return "low"
+    if provider == "noaa_ncei" and outcome_status == FINAL_LABEL_STATUS:
+        return "high" if candidate.get("source_confidence") == "high" else "medium"
+    if outcome_status == PROVISIONAL_LABEL_STATUS:
+        return "medium"
+    return str(candidate.get("source_confidence") or "low")
+
+
+def build_label_attempt(
+    candidate: dict[str, Any],
+    *,
+    attempted_at: str,
+    source_record: weather_sources.SourceRecord | None,
+    source_provider: str,
+    source_family: str,
+    source_status: str,
+    outcome_status: str,
+    reason: str,
+    final_high_f: float | None = None,
+    label_value: float | None = None,
+    bucket: BucketSpec | None = None,
+    station_id: str | None = None,
+) -> dict[str, Any]:
+    provider = source_record.provider if source_record else source_provider
+    family = source_record.family if source_record else source_family
+    provenance = source_record.to_dict() if source_record else {
+        "provider": provider,
+        "family": family,
+        "read_only": True,
+        "requires_credentials": False,
+        "fetched_at": attempted_at,
+    }
+    return {
+        "attempted_at": attempted_at,
+        "training_row_id": candidate.get("training_row_id"),
+        "position_id": candidate.get("position_id"),
+        "market_id": candidate.get("market_id"),
+        "title": candidate.get("title"),
+        "outcome": candidate.get("outcome"),
+        "target_date": candidate.get("target_date"),
+        "station_id": station_id or candidate.get("station_id"),
+        "source_provider": provider,
+        "source_family": family,
+        "source_url": source_record.source_url if source_record else None,
+        "source_status": source_record.status if source_record else source_status,
+        "station_confidence": label_station_confidence(candidate, provider, outcome_status),
+        "final_high_f": final_high_f,
+        "threshold_low_f": finite_or_none(bucket.lo if bucket else None),
+        "threshold_high_f": finite_or_none(bucket.hi if bucket else None),
+        "label_value": label_value,
+        "outcome_status": outcome_status,
+        "reason": reason,
+        "provenance_json": bounded_json(provenance, RAW_JSON_LIMIT),
+        "raw_excerpt": compact_text((source_record.data if source_record else provenance), RAW_EXCERPT_LIMIT),
+    }
+
+
+def insert_label_attempt(db: sqlite3.Connection, attempt: dict[str, Any]) -> int:
+    columns = [
+        "attempted_at",
+        "training_row_id",
+        "position_id",
+        "market_id",
+        "title",
+        "outcome",
+        "target_date",
+        "station_id",
+        "source_provider",
+        "source_family",
+        "source_url",
+        "source_status",
+        "station_confidence",
+        "final_high_f",
+        "threshold_low_f",
+        "threshold_high_f",
+        "label_value",
+        "outcome_status",
+        "reason",
+        "provenance_json",
+        "raw_excerpt",
+    ]
+    cur = db.execute(
+        f"insert into label_attempts({','.join(columns)}) values ({','.join(['?'] * len(columns))})",
+        tuple(attempt.get(column) for column in columns),
+    )
+    return int(cur.lastrowid)
+
+
+def matching_unlabeled_training_row_ids(db: sqlite3.Connection, candidate: dict[str, Any]) -> list[int]:
+    rows = db.execute(
+        """
+        select id
+        from training_rows
+        where coalesce(market_id,'')=coalesce(?, '')
+          and coalesce(outcome,'')=coalesce(?, '')
+          and coalesce(target_date,'')=coalesce(?, '')
+          and coalesce(station_id,'')=coalesce(?, '')
+          and coalesce(label_status,'') <> ?
+        """,
+        (
+            candidate.get("market_id"),
+            candidate.get("outcome"),
+            candidate.get("target_date"),
+            candidate.get("station_id"),
+            FINAL_LABEL_STATUS,
+        ),
+    ).fetchall()
+    return [int(row[0]) for row in rows]
+
+
+def apply_final_label_to_training_rows(
+    db: sqlite3.Connection,
+    candidate: dict[str, Any],
+    attempt: dict[str, Any],
+    attempt_id: int | None,
+) -> int:
+    label_value = attempt.get("label_value")
+    if label_value not in (0.0, 1.0, 0, 1):
+        return 0
+    row_ids = matching_unlabeled_training_row_ids(db, candidate)
+    if not row_ids:
+        return 0
+    placeholders = ",".join("?" for _ in row_ids)
+    label_source = str(attempt.get("source_provider") or "")
+    if attempt_id is not None:
+        label_source = f"{label_source}:attempt:{attempt_id}"
+    db.execute(
+        f"""
+        update training_rows
+        set label_status=?, label_value=?, label_source=?, labeled_at=?
+        where id in ({placeholders})
+        """,
+        (
+            FINAL_LABEL_STATUS,
+            float(label_value),
+            label_source,
+            attempt.get("attempted_at"),
+            *row_ids,
+        ),
+    )
+    return len(row_ids)
+
+
+def label_candidate_groups(
+    db: sqlite3.Connection,
+    cutoff_date: str,
+    retry_before: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    rows = db.execute(
+        """
+        select
+          min(tr.id) as training_row_id,
+          tr.market_id,
+          tr.title,
+          tr.outcome,
+          tr.city,
+          tr.target_date,
+          tr.station_id,
+          tr.station_source,
+          tr.source_confidence,
+          tr.market_family,
+          min(la.attempted_at) as first_attempt,
+          max(la.attempted_at) as latest_attempt
+        from training_rows tr
+        left join label_attempts la
+          on coalesce(la.market_id,'')=coalesce(tr.market_id,'')
+         and coalesce(la.outcome,'')=coalesce(tr.outcome,'')
+         and coalesce(la.target_date,'')=coalesce(tr.target_date,'')
+         and coalesce(la.station_id,'')=coalesce(tr.station_id,'')
+        where tr.target_date is not null
+          and tr.target_date <> ''
+          and tr.target_date <= ?
+          and coalesce(tr.label_status,'') <> ?
+          and (tr.market_family is null or tr.market_family='' or tr.market_family='daily_temperature')
+        group by tr.market_id, tr.outcome, tr.target_date, tr.station_id
+        having latest_attempt is null or latest_attempt < ?
+        order by tr.target_date asc, training_row_id asc
+        limit ?
+        """,
+        (cutoff_date, FINAL_LABEL_STATUS, retry_before, limit),
+    ).fetchall()
+    return [
+        {
+            "training_row_id": int(row[0]),
+            "market_id": row[1],
+            "title": row[2],
+            "outcome": row[3],
+            "city": row[4],
+            "target_date": row[5],
+            "station_id": row[6],
+            "station_source": row[7],
+            "source_confidence": row[8],
+            "market_family": row[9],
+            "first_attempt": row[10],
+            "latest_attempt": row[11],
+            "position_id": None,
+        }
+        for row in rows
+    ]
+
+
+def attempt_delayed_label(candidate: dict[str, Any], args: argparse.Namespace, attempted_at: str) -> list[dict[str, Any]]:
+    label_value, bucket, bucket_reason = determine_label_value(0.0, candidate.get("title"), candidate.get("outcome"))
+    if bucket is None:
+        return [
+            build_label_attempt(
+                candidate,
+                attempted_at=attempted_at,
+                source_record=None,
+                source_provider="labeler",
+                source_family="labeler",
+                source_status=SKIPPED_LABEL_STATUS,
+                outcome_status=SKIPPED_LABEL_STATUS,
+                reason=bucket_reason,
+            )
+        ]
+    if not candidate.get("station_id"):
+        return [
+            build_label_attempt(
+                candidate,
+                attempted_at=attempted_at,
+                source_record=None,
+                source_provider="labeler",
+                source_family="labeler",
+                source_status=SKIPPED_LABEL_STATUS,
+                outcome_status=SKIPPED_LABEL_STATUS,
+                reason="missing_station_id",
+                bucket=bucket,
+            )
+        ]
+
+    attempts: list[dict[str, Any]] = []
+    timeout = float(getattr(args, "http_timeout", weather_sources.DEFAULT_TIMEOUT_SECONDS))
+    ttl = int(getattr(args, "cache_ttl", weather_sources.DEFAULT_CACHE_TTL_SECONDS))
+    if getattr(args, "enable_ncei", False):
+        adapter = weather_sources.NOAADelayedLabelAdapter(enabled=True, timeout_seconds=timeout, cache_ttl_seconds=ttl)
+        for station_identifier in ncei_station_identifiers(str(candidate.get("station_id"))):
+            record = adapter.fetch_daily_summary(station_identifier, str(candidate.get("target_date")))
+            high = record.data.get("daily_high_f") if isinstance(record.data, dict) else None
+            if high is not None:
+                final_value, final_bucket, reason = determine_label_value(float(high), candidate.get("title"), candidate.get("outcome"))
+                if final_value is not None and final_bucket is not None:
+                    return [
+                        build_label_attempt(
+                            candidate,
+                            attempted_at=attempted_at,
+                            source_record=record,
+                            source_provider=record.provider,
+                            source_family=record.family,
+                            source_status=record.status,
+                            outcome_status=FINAL_LABEL_STATUS,
+                            reason=reason,
+                            final_high_f=float(high),
+                            label_value=final_value,
+                            bucket=final_bucket,
+                            station_id=station_identifier,
+                        )
+                    ]
+            attempts.append(
+                build_label_attempt(
+                    candidate,
+                    attempted_at=attempted_at,
+                    source_record=record,
+                    source_provider=record.provider,
+                    source_family=record.family,
+                    source_status=record.status,
+                    outcome_status=PENDING_LABEL_STATUS if record.status != "error" else ERROR_LABEL_STATUS,
+                    reason=record.error or record.status or "ncei_daily_high_unavailable",
+                    bucket=bucket,
+                    station_id=station_identifier,
+                )
+            )
+            time.sleep(float(getattr(args, "pause", 0.0) or 0.0))
+
+    if getattr(args, "enable_nws", False):
+        adapter = weather_sources.NWSAdapter(enabled=True, timeout_seconds=timeout, cache_ttl_seconds=ttl)
+        record = adapter.fetch_daily_high(str(candidate.get("station_id")), str(candidate.get("target_date")))
+        high = record.data.get("daily_high_f") if isinstance(record.data, dict) else None
+        if high is not None:
+            provisional_value, provisional_bucket, reason = determine_label_value(float(high), candidate.get("title"), candidate.get("outcome"))
+            if provisional_value is not None and provisional_bucket is not None:
+                attempts.append(
+                    build_label_attempt(
+                        candidate,
+                        attempted_at=attempted_at,
+                        source_record=record,
+                        source_provider=record.provider,
+                        source_family=record.family,
+                        source_status=record.status,
+                        outcome_status=PROVISIONAL_LABEL_STATUS,
+                        reason=f"supporting_nws_observations_{reason}",
+                        final_high_f=float(high),
+                        label_value=provisional_value,
+                        bucket=provisional_bucket,
+                    )
+                )
+                return attempts
+        else:
+            attempts.append(
+                build_label_attempt(
+                    candidate,
+                    attempted_at=attempted_at,
+                    source_record=record,
+                    source_provider=record.provider,
+                    source_family=record.family,
+                    source_status=record.status,
+                    outcome_status=PENDING_LABEL_STATUS if record.status != "error" else ERROR_LABEL_STATUS,
+                    reason=record.error or record.status or "nws_daily_high_unavailable",
+                    bucket=bucket,
+                )
+            )
+
+    if getattr(args, "enable_iem", False):
+        adapter = weather_sources.IEMMetarAdapter(enabled=True, timeout_seconds=timeout, cache_ttl_seconds=ttl)
+        record = adapter.fetch_daily_high(str(candidate.get("station_id")), str(candidate.get("target_date")))
+        high = record.data.get("daily_high_f") if isinstance(record.data, dict) else None
+        if high is not None:
+            provisional_value, provisional_bucket, reason = determine_label_value(float(high), candidate.get("title"), candidate.get("outcome"))
+            if provisional_value is not None and provisional_bucket is not None:
+                attempts.append(
+                    build_label_attempt(
+                        candidate,
+                        attempted_at=attempted_at,
+                        source_record=record,
+                        source_provider=record.provider,
+                        source_family=record.family,
+                        source_status=record.status,
+                        outcome_status=PROVISIONAL_LABEL_STATUS,
+                        reason=f"supporting_iem_asos_{reason}",
+                        final_high_f=float(high),
+                        label_value=provisional_value,
+                        bucket=provisional_bucket,
+                    )
+                )
+                return attempts
+        else:
+            attempts.append(
+                build_label_attempt(
+                    candidate,
+                    attempted_at=attempted_at,
+                    source_record=record,
+                    source_provider=record.provider,
+                    source_family=record.family,
+                    source_status=record.status,
+                    outcome_status=PENDING_LABEL_STATUS if record.status != "error" else ERROR_LABEL_STATUS,
+                    reason=record.error or record.status or "iem_daily_high_unavailable",
+                    bucket=bucket,
+                )
+            )
+
+    if attempts:
+        return attempts
+    return [
+        build_label_attempt(
+            candidate,
+            attempted_at=attempted_at,
+            source_record=None,
+            source_provider="labeler",
+            source_family="labeler",
+            source_status=SKIPPED_LABEL_STATUS,
+            outcome_status=SKIPPED_LABEL_STATUS,
+            reason="all_label_sources_disabled",
+            bucket=bucket,
+        )
+    ]
+
+
+def final_label_for_position(db: sqlite3.Connection, market_id: str, outcome: str) -> tuple[int, float, str | None, str | None, int | None, float | None] | None:
+    row = db.execute(
+        """
+        select tr.id, tr.label_value, tr.label_source, tr.labeled_at, la.id, la.final_high_f
+        from training_rows tr
+        left join label_attempts la
+          on la.training_row_id=tr.id
+         and la.outcome_status=?
+         and la.label_value=tr.label_value
+        where tr.market_id=?
+          and tr.outcome=?
+          and tr.label_status=?
+          and tr.label_value in (0, 1)
+        order by tr.labeled_at desc, tr.id desc, la.id desc
+        limit 1
+        """,
+        (FINAL_LABEL_STATUS, market_id, outcome, FINAL_LABEL_STATUS),
+    ).fetchone()
+    if not row:
+        return None
+    return int(row[0]), float(row[1]), row[2], row[3], int(row[4]) if row[4] is not None else None, float(row[5]) if row[5] is not None else None
+
+
+def settle_paper_positions_from_labels(db: sqlite3.Connection, now: str) -> int:
+    account = account_row(db)
+    account_id = int(account[0])
+    positions = db.execute(
+        """
+        select id, market_id, outcome, shares, cost_basis
+        from paper_positions
+        where account_id=? and status='open'
+        """,
+        (account_id,),
+    ).fetchall()
+    settled = 0
+    for pos_id, market_id, outcome, shares, cost_basis in positions:
+        label = final_label_for_position(db, str(market_id), str(outcome))
+        if not label:
+            continue
+        source_training_row_id, label_value, label_source, _labeled_at, label_attempt_id, final_high_f = label
+        existing = db.execute("select id from paper_settlements where position_id=?", (pos_id,)).fetchone()
+        if existing:
+            continue
+        payout = float(shares) * float(label_value)
+        realized = payout - float(cost_basis)
+        db.execute("update paper_positions set latest_mark=?, updated_at=? where id=?", (label_value, now, pos_id))
+        db.execute(
+            """
+            insert into paper_settlements(
+              position_id, settled_at, outcome_status, payout, realized_pnl,
+              source_signal_id, source_training_row_id, label_attempt_id,
+              label_source, final_high_f
+            )
+            values(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                pos_id,
+                now,
+                "resolved_win" if label_value >= 1.0 else "resolved_loss",
+                payout,
+                realized,
+                None,
+                source_training_row_id,
+                label_attempt_id,
+                label_source,
+                final_high_f,
+            ),
+        )
+        db.execute(
+            "update paper_positions set status='settled', realized_pnl=?, updated_at=? where id=?",
+            (realized, now, pos_id),
+        )
+        db.execute(
+            "update paper_accounts set cash=cash+?, realized_pnl=realized_pnl+?, updated_at=? where id=?",
+            (payout, realized, now, account_id),
+        )
+        settled += 1
+    return settled
+
+
+def label(args: argparse.Namespace) -> None:
+    ensure_paper_only_guard(args)
+    db = init_db(args.db)
+    now = utc_now_iso()
+    today = dt.datetime.fromisoformat(now).date()
+    cutoff = today - dt.timedelta(days=max(0, int(getattr(args, "min_age_days", 2))))
+    retry_before_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max(0.0, float(getattr(args, "retry_after_hours", 12.0))))
+    retry_before = retry_before_dt.replace(microsecond=0).isoformat()
+    candidates = label_candidate_groups(db, cutoff.isoformat(), retry_before, int(args.limit))
+    attempts_written = 0
+    final_groups = 0
+    final_rows = 0
+    provisional = 0
+    pending = 0
+    skipped = 0
+    errors = 0
+
+    for candidate in candidates:
+        attempts = attempt_delayed_label(candidate, args, now)
+        for attempt in attempts:
+            status = str(attempt.get("outcome_status") or "")
+            if status == FINAL_LABEL_STATUS:
+                final_groups += 1
+            elif status == PROVISIONAL_LABEL_STATUS:
+                provisional += 1
+            elif status == PENDING_LABEL_STATUS:
+                pending += 1
+            elif status == SKIPPED_LABEL_STATUS:
+                skipped += 1
+            elif status == ERROR_LABEL_STATUS:
+                errors += 1
+            if args.dry_run:
+                continue
+            attempt_id = insert_label_attempt(db, attempt)
+            attempts_written += 1
+            if status == FINAL_LABEL_STATUS:
+                final_rows += apply_final_label_to_training_rows(db, candidate, attempt, attempt_id)
+
+    settled_positions = 0
+    if not args.dry_run and not args.no_settle:
+        settled_positions = settle_paper_positions_from_labels(db, now)
+        if final_rows or settled_positions or attempts_written:
+            record_account_snapshot(db, None, now)
+    if not args.dry_run:
+        db.commit()
+
+    print("labeler=paper_only")
+    print("mode=paper_only live_trading=false wallet=false order_placement=false")
+    print(
+        f"dry_run={str(bool(args.dry_run)).lower()} cutoff_date={cutoff.isoformat()} "
+        f"candidates={len(candidates)} attempts_written={attempts_written} "
+        f"final_label_groups={final_groups} final_training_rows={final_rows} "
+        f"provisional_attempts={provisional} pending_attempts={pending} "
+        f"skipped_attempts={skipped} error_attempts={errors} settled_positions={settled_positions}"
+    )
 
 
 def evaluate(args: argparse.Namespace) -> None:
@@ -2639,9 +3254,11 @@ def portfolio(args: argparse.Namespace) -> None:
     now = utc_now_iso()
     if args.settle:
         settle_paper_positions_from_latest_prices(db, now)
+    if getattr(args, "settle_labels", False):
+        settle_paper_positions_from_labels(db, now)
     if args.snapshot:
         record_account_snapshot(db, None, now)
-    if args.settle or args.snapshot:
+    if args.settle or getattr(args, "settle_labels", False) or args.snapshot:
         db.commit()
     metrics = portfolio_metrics(db)
     print("portfolio=paper_only")
@@ -2798,7 +3415,24 @@ def build_parser() -> argparse.ArgumentParser:
     pf.add_argument("--positions", type=int, default=10, help="Number of recent positions to print")
     pf.add_argument("--snapshot", action="store_true", help="Record a paper account snapshot")
     pf.add_argument("--settle", action="store_true", help="Settle paper positions from latest stored prices when possible")
+    pf.add_argument("--settle-labels", action="store_true", help="Settle paper positions from final delayed labels when available")
     pf.set_defaults(func=portfolio)
+    lb = sub.add_parser("label", help="Attempt delayed read-only weather labels and settle paper positions from final labels")
+    lb.add_argument("--limit", type=int, default=int(os.environ.get("LABEL_LIMIT", "25")), help="Maximum unresolved market/outcome groups to attempt")
+    lb.add_argument("--min-age-days", type=int, default=int(os.environ.get("LABEL_MIN_AGE_DAYS", "2")), help="Only label target dates at least this many days old")
+    lb.add_argument("--retry-after-hours", type=float, default=float(os.environ.get("LABEL_RETRY_AFTER_HOURS", "12")), help="Do not retry the same unresolved group sooner than this")
+    lb.add_argument("--pause", type=float, default=float(os.environ.get("LABEL_PAUSE_SECONDS", os.environ.get("SCAN_PAUSE_SECONDS", "0.05"))), help="Seconds between delayed source calls")
+    lb.add_argument("--http-timeout", type=float, default=float(os.environ.get("HTTP_TIMEOUT_SECONDS", "8")), help="HTTP timeout for read-only label sources")
+    lb.add_argument("--cache-ttl", type=int, default=int(os.environ.get("OBSERVATION_CACHE_TTL_SECONDS", "300")), help="In-process source cache TTL seconds")
+    lb.add_argument("--enable-ncei", dest="enable_ncei", action="store_true", default=env_bool("ENABLE_NCEI_DAILY", False), help="Use tokenless NOAA/NCEI daily summaries for final labels")
+    lb.add_argument("--disable-ncei", dest="enable_ncei", action="store_false", help="Disable NOAA/NCEI daily summary label attempts")
+    lb.add_argument("--enable-nws", dest="enable_nws", action="store_true", default=env_bool("ENABLE_NWS", False), help="Use NWS station observations as provisional supporting evidence")
+    lb.add_argument("--disable-nws", dest="enable_nws", action="store_false", help="Disable NWS provisional label attempts")
+    lb.add_argument("--enable-iem", dest="enable_iem", action="store_true", default=env_bool("ENABLE_IEM", False), help="Use IEM/ASOS daily highs as provisional supporting evidence")
+    lb.add_argument("--disable-iem", dest="enable_iem", action="store_false", help="Disable IEM/ASOS provisional label attempts")
+    lb.add_argument("--dry-run", action="store_true", help="Find candidates and sources without writing labels, attempts, settlements, or snapshots")
+    lb.add_argument("--no-settle", action="store_true", help="Do not settle paper positions after writing final labels")
+    lb.set_defaults(func=label)
     x = sub.add_parser("export-training", help="Export decision-time training rows to CSV")
     x.add_argument("--output", default=TRAINING_EXPORT_PATH)
     x.add_argument("--limit", type=int)

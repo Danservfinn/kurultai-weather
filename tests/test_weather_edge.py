@@ -13,6 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import scanner
+import weather_sources
 
 
 class WeatherEdgeTests(unittest.TestCase):
@@ -204,6 +205,163 @@ class WeatherEdgeTests(unittest.TestCase):
             self.assertEqual(payload["excluded_future_source_count"], 0)
             self.assertNotIn("label_value", json.dumps(payload))
             self.assertEqual(payload["settlement_station_id_normalized"], "KDEN")
+
+    def test_label_outcome_determination_for_numeric_and_no_tokens(self):
+        value, bucket, reason = scanner.determine_label_value(83.0, "Denver high temperature", "80°F+")
+        self.assertEqual(reason, "ok")
+        self.assertIsNotNone(bucket)
+        self.assertEqual(value, 1.0)
+
+        value, bucket, reason = scanner.determine_label_value(83.0, "Will Denver high temperature be 80°F or above?", "No")
+        self.assertEqual(reason, "ok")
+        self.assertIsNotNone(bucket)
+        self.assertEqual(value, 0.0)
+
+    def test_labeler_writes_final_labels_without_rewriting_features(self):
+        class FakeNCEIAdapter:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def fetch_daily_summary(self, station_id, date):
+                return weather_sources.SourceRecord(
+                    provider="noaa_ncei",
+                    family="ncei_daily_labels",
+                    status="ok",
+                    fetched_at="2026-05-10T12:00:00+00:00",
+                    source_url="https://www.ncei.noaa.gov/access/services/data/v1",
+                    data={"daily_high_f": 83.0},
+                    provenance={"read_only": True, "station_id": station_id, "date": date},
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "paper.sqlite3")
+            db = scanner.init_db(db_path)
+            before_features = '{"source_quality_score": 1, "no_lookahead_enforced": true}'
+            for row_id in (1, 2):
+                db.execute(
+                    """
+                    insert into training_rows(
+                      created_at, market_id, title, outcome, city, target_date,
+                      station_id, station_source, source_confidence, market_family,
+                      signal_type, features_json
+                    )
+                    values(?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        f"2026-05-0{row_id}T12:00:00+00:00",
+                        "m-label",
+                        "Will Denver high temperature be 80°F or above?",
+                        "Yes",
+                        "Denver",
+                        "2020-01-01",
+                        "KDEN",
+                        "station_registry",
+                        "medium",
+                        "daily_temperature",
+                        "paper_buy_forecast_distribution",
+                        before_features,
+                    ),
+                )
+            db.commit()
+            db.close()
+
+            original = weather_sources.NOAADelayedLabelAdapter
+            weather_sources.NOAADelayedLabelAdapter = FakeNCEIAdapter
+            try:
+                args = argparse.Namespace(
+                    db=db_path,
+                    limit=10,
+                    min_age_days=0,
+                    retry_after_hours=0,
+                    pause=0.0,
+                    http_timeout=1.0,
+                    cache_ttl=1,
+                    enable_ncei=True,
+                    enable_nws=False,
+                    enable_iem=False,
+                    dry_run=False,
+                    no_settle=True,
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    scanner.label(args)
+            finally:
+                weather_sources.NOAADelayedLabelAdapter = original
+
+            db = scanner.init_db(db_path)
+            rows = db.execute(
+                "select label_status, label_value, label_source, features_json from training_rows order by id"
+            ).fetchall()
+            self.assertEqual([row[0] for row in rows], ["final", "final"])
+            self.assertEqual([row[1] for row in rows], [1.0, 1.0])
+            self.assertTrue(all(str(row[2]).startswith("noaa_ncei:attempt:") for row in rows))
+            self.assertEqual([row[3] for row in rows], [before_features, before_features])
+            self.assertEqual(db.execute("select count(*) from label_attempts where outcome_status='final'").fetchone()[0], 1)
+
+    def test_label_based_settlement_preserves_accounting(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+            args = argparse.Namespace(
+                disable_ledger=False,
+                paper_size=5.0,
+                max_position_pct=0.02,
+                max_city_date_pct=0.10,
+                max_open_exposure_pct=0.50,
+                min_fill_shares=1.0,
+            )
+            quote = {
+                "execution_source": "clob_book",
+                "entry_price": 0.40,
+                "ask": 0.40,
+                "depth": 10.0,
+                "depth_sufficient": True,
+                "raw_status": "ok",
+            }
+            scanner.simulate_paper_order(
+                db,
+                args,
+                run_id=1,
+                signal_id=1,
+                created_at="2026-05-09T00:00:00+00:00",
+                m={"market_id": "m-settle", "title": "Will Denver high temperature be 80°F or above?"},
+                outcome="Yes",
+                token_id="token-1",
+                city="Denver",
+                target_date="2026-05-09",
+                signal_type="paper_buy_forecast_distribution",
+                quote=quote,
+            )
+            db.execute(
+                """
+                insert into training_rows(
+                  created_at, market_id, title, outcome, target_date, station_id,
+                  market_family, label_status, label_value, label_source, labeled_at
+                )
+                values(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "2026-05-09T00:00:00+00:00",
+                    "m-settle",
+                    "Will Denver high temperature be 80°F or above?",
+                    "Yes",
+                    "2026-05-09",
+                    "KDEN",
+                    "daily_temperature",
+                    "final",
+                    1.0,
+                    "noaa_ncei:attempt:1",
+                    "2026-05-11T00:00:00+00:00",
+                ),
+            )
+
+            settled = scanner.settle_paper_positions_from_labels(db, "2026-05-11T00:00:00+00:00")
+            metrics = scanner.portfolio_metrics(db)
+
+            self.assertEqual(settled, 1)
+            self.assertAlmostEqual(metrics["cash"], 1003.0)
+            self.assertAlmostEqual(metrics["realized_pnl"], 3.0)
+            self.assertAlmostEqual(metrics["equity"], 1003.0)
+            self.assertEqual(metrics["unresolved_positions"], 0)
+            self.assertEqual(db.execute("select count(*) from paper_settlements").fetchone()[0], 1)
 
     def test_goal_tuning_scaffold_guardrails(self):
         with tempfile.TemporaryDirectory() as td:

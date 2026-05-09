@@ -41,6 +41,7 @@ Each iteration includes:
 - Current tunables.
 - Proposed tunables, if any.
 - Available performance metrics.
+- Label availability and paper settlement counts.
 - Approval status.
 - Sanitized paper-only safety flags.
 
@@ -55,5 +56,7 @@ Secondary metrics:
 - Brier score when enough labeled rows have model probabilities and binary labels.
 - Maximum drawdown from paper account snapshots.
 - Unresolved rate from labeled vs. unlabeled training rows.
+
+Only final delayed labels count toward tuning readiness. Pending, skipped, error, and provisional label attempts remain useful diagnostics but do not satisfy the labeled-row gate.
 
 Tuning should stay proposal-only until the paper ledger has enough labeled evidence to evaluate whether an apparent edge survives spread, liquidity, station ambiguity, and stale data.

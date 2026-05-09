@@ -18,6 +18,7 @@ The dashboard includes:
 - Paper bankroll stats.
 - Core row counts.
 - Evidence progress.
+- Labeling and settlement progress.
 - Equity trail.
 - Tuning readiness and performance trace.
 - Tuning iteration performance.
@@ -27,6 +28,8 @@ The dashboard includes:
 - Recent paper orders, fills, and positions.
 
 The Tuning Iteration Performance section is expected to show insufficient-data tune attempts before labels exist.
+
+The Labeling and Settlement Progress section shows final labeled rows, pending rows, unresolved/open paper positions, settled positions, recent label attempts, source coverage, and blockers. Provisional label attempts remain visible but do not settle paper positions.
 
 ## Live Local Refresh
 
@@ -44,9 +47,22 @@ The normal tuning command is:
 python3 scanner.py tune --goal goals/paper_weather_edge_v1.yaml
 ```
 
+The normal delayed-label refresh command is:
+
+```bash
+python3 scanner.py label --limit 25 --min-age-days 2
+```
+
+The cron-safe wrapper is:
+
+```bash
+./run_labeler_and_render.sh
+```
+
 ## Operational Rules
 
 - Keep scans unattended but paper-only.
 - Refresh the dashboard after scans or tune checks.
 - Do not add API keys, cookies, wallets, private keys, or signing flows to dashboard code.
 - Treat the dashboard as observability and review UI, not an execution UI.
+- Keep labeler provider flags in `runtime_tunables.env`; commercial/paid providers remain disabled by default.
