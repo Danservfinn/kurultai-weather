@@ -188,6 +188,79 @@ class EdgeValidationTests(unittest.TestCase):
         self.assertLess(row["ambiguity_control"], 0.5)
         self.assertEqual(row["verdict"], edge_validation.KILL_OR_DISABLE)
 
+    def test_inconclusive_family_is_not_disabled_during_bootstrap(self) -> None:
+        path = make_db()
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        insert_family(path, "latency_absorbing_state", n=12, days=4, good=True)
+
+        self.assertEqual(edge_validation.evaluate_strategy_families(path)[0]["verdict"], edge_validation.INCONCLUSIVE)
+        self.assertEqual(edge_validation.disabled_families(path), set())
+
+    def test_killed_family_is_disabled(self) -> None:
+        path = make_db()
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        insert_family(path, "ladder_inconsistency", n=120, days=15, good=False)
+
+        self.assertIn("ladder_inconsistency", edge_validation.disabled_families(path))
+
+    def test_strict_gate_disables_non_promoted_family(self) -> None:
+        path = make_db()
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        insert_family(path, "latency_absorbing_state", n=12, days=4, good=True)
+
+        self.assertIn("latency_absorbing_state", edge_validation.disabled_families(path, strict=True))
+
+    def test_market_brier_uses_market_probability_not_entry_price(self) -> None:
+        path = make_db()
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        con = sqlite3.connect(path)
+        for i in range(60):
+            candidate_key = f"cal-{i}"
+            con.execute(
+                """
+                insert into training_rows(
+                  signal_id, created_at, market_id, outcome, market_prob, model_prob, entry_price, edge,
+                  depth_sufficient, label_value, event_key, candidate_key, strategy_family,
+                  eligibility_class, source_confidence, settlement_state, quote_age_seconds, stale_book_flag
+                ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (i + 1, "2026-01-01T00:00:00+00:00", f"m{i}", "yes", 0.90, 0.90, 0.10, 0.05,
+                 1, 1.0, f"e{i}", candidate_key, "settlement_source_edge", "clean_station", "high", "unknown", 60.0, 0),
+            )
+        con.commit()
+        con.close()
+
+        row = edge_validation.evaluate_strategy_families(path)[0]
+
+        self.assertAlmostEqual(row["market_brier"], 0.01, places=6)
+        self.assertAlmostEqual(row["entry_price_brier_diagnostic"], 0.81, places=6)
+
+    def test_missing_quote_age_is_not_fresh(self) -> None:
+        path = make_db()
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        con = sqlite3.connect(path)
+        for i in range(20):
+            con.execute(
+                "insert into signals(id, created_at, market_id, outcome, signal_type, market_prob, model_prob, edge, entry_price, depth_sufficient, event_key, candidate_key, strategy_family, quote_age_seconds, stale_book_flag) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (i + 1, "2026-01-01T00:00:00+00:00", f"m{i}", "yes", "paper_buy_forecast_distribution", 0.5, 0.6, 0.1, 0.5, 1, f"e{i}", f"fresh-{i}", "diurnal_nowcast", None, 0),
+            )
+        con.commit()
+        con.close()
+
+        row = edge_validation.evaluate_strategy_families(path)[0]
+
+        self.assertEqual(row["fresh_quote_rate"], 0.0)
+
+    def test_promotion_requires_real_fill_count(self) -> None:
+        path = make_db()
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        insert_family(path, "forecast_distribution_directional", n=320, days=16, good=True, filled_every=20)
+
+        row = edge_validation.evaluate_strategy_families(path)[0]
+
+        self.assertLess(row["fills"], edge_validation.MIN_FILLS_FOR_PROMOTION)
+        self.assertNotEqual(row["verdict"], edge_validation.PROMOTE_PAPER_SIZE)
+
 
 if __name__ == "__main__":
     unittest.main()

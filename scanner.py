@@ -1698,6 +1698,19 @@ def init_db(path: str) -> sqlite3.Connection:
           shares real not null, price real not null, cost real not null,
           slippage real, source text, raw_status text
         );
+        create table if not exists shadow_orders (
+          id integer primary key, run_id integer, signal_id integer, market_id text,
+          token_id text, outcome text, side text not null, signal_type text,
+          requested_shares real, limit_price real, estimated_cost real,
+          shadow_reason text not null, created_at text not null, event_key text,
+          candidate_key text, strategy_family text
+        );
+        create table if not exists shadow_fills (
+          id integer primary key, shadow_order_id integer not null, filled_at text not null,
+          shares real not null, price real not null, cost real not null,
+          slippage real, source text, raw_status text, event_key text,
+          candidate_key text, strategy_family text
+        );
         create table if not exists paper_positions (
           id integer primary key, account_id integer not null, market_id text not null,
           token_id text, title text, outcome text not null, city text, target_date text,
@@ -1906,6 +1919,24 @@ def init_db(path: str) -> sqlite3.Connection:
     ensure_columns(
         db,
         "paper_fills",
+        {
+            "event_key": "text",
+            "candidate_key": "text",
+            "strategy_family": "text",
+        },
+    )
+    ensure_columns(
+        db,
+        "shadow_orders",
+        {
+            "event_key": "text",
+            "candidate_key": "text",
+            "strategy_family": "text",
+        },
+    )
+    ensure_columns(
+        db,
+        "shadow_fills",
         {
             "event_key": "text",
             "candidate_key": "text",
@@ -2650,9 +2681,9 @@ def paper_buy_survival_gate_disabled(args: argparse.Namespace, strategy_family: 
     """Return True when paper-buy orders for a strategy family should be skipped.
 
     The gate is paper-only: it does not affect signal/training-row collection.
-    By default, families that fail the Strategy Family Survival evidence gate
-    (anything other than PROMOTE_PAPER_SIZE) are prevented from consuming the
-    paper ledger until they earn promotion.
+    By default, only KILL_OR_DISABLE families are prevented from consuming the
+    paper ledger; INCONCLUSIVE and CONTINUE_OBSERVING remain in bootstrap
+    evidence collection. Use --strict-survival-gate for promote-only fills.
     """
     if getattr(args, "allow_weak_families", False):
         return False
@@ -2662,12 +2693,102 @@ def paper_buy_survival_gate_disabled(args: argparse.Namespace, strategy_family: 
     cache = getattr(args, "_paper_buy_disabled_families", None)
     if cache is None:
         try:
-            cache = edge_validation.disabled_families(DB_PATH)
+            cache = edge_validation.disabled_families(DB_PATH, strict=getattr(args, "strict_survival_gate", False))
         except Exception as exc:  # dashboard/reporting data must not break scan collection
             cache = set()
             setattr(args, "_paper_buy_survival_gate_error", str(exc))
         setattr(args, "_paper_buy_disabled_families", cache)
     return family in cache
+
+
+def record_shadow_survival_gate_fill(
+    db: sqlite3.Connection,
+    run_id: int,
+    signal_id: int,
+    created_at: str,
+    m: dict[str, Any],
+    outcome: str,
+    token_id: str | None,
+    signal_type: str,
+    quote: dict[str, Any],
+    requested: float,
+    event_key: str | None,
+    candidate_key: str | None,
+    strategy_family: str,
+) -> tuple[int | None, int | None]:
+    """Record a separate hypothetical fill for survival-gated families.
+
+    Shadow rows do not touch account cash, positions, or official paper PnL.
+    They preserve counterfactual executable evidence so the survival gate cannot
+    hide whether a blocked family would have improved.
+    """
+    entry = quote.get("entry_price")
+    if (
+        not token_id
+        or quote.get("execution_source") != "clob_book"
+        or not quote.get("depth_sufficient")
+        or entry is None
+        or float(entry) <= 0.0
+    ):
+        return None, None
+    depth = float(quote.get("depth") or 0.0)
+    shares = min(float(requested or 0.0), depth)
+    if shares <= 0.0:
+        return None, None
+    price = float(entry)
+    cost = shares * price
+    cur = db.execute(
+        """
+        insert into shadow_orders(
+          run_id, signal_id, market_id, token_id, outcome, side, signal_type,
+          requested_shares, limit_price, estimated_cost, shadow_reason, created_at,
+          event_key, candidate_key, strategy_family
+        )
+        values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            run_id,
+            signal_id,
+            m.get("market_id"),
+            token_id,
+            outcome,
+            "buy_yes",
+            signal_type,
+            requested,
+            entry,
+            cost,
+            "survival_gate_disabled",
+            created_at,
+            event_key,
+            candidate_key,
+            strategy_family,
+        ),
+    )
+    shadow_order_id = int(cur.lastrowid)
+    db.execute(
+        """
+        insert into shadow_fills(
+          shadow_order_id, filled_at, shares, price, cost, slippage, source,
+          raw_status, event_key, candidate_key, strategy_family
+        )
+        values(?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            shadow_order_id,
+            created_at,
+            shares,
+            price,
+            cost,
+            price - float(quote.get("ask") or price),
+            quote.get("execution_source"),
+            quote.get("raw_status"),
+            event_key,
+            candidate_key,
+            strategy_family,
+        ),
+    )
+    return shadow_order_id, int(db.execute("select last_insert_rowid()").fetchone()[0])
+
 
 
 def simulate_paper_order(
@@ -2703,6 +2824,21 @@ def simulate_paper_order(
         reason = "missing_token_id"
     elif paper_buy_survival_gate_disabled(args, strategy_family):
         reason = "strategy_family_survival_gate_disabled"
+        record_shadow_survival_gate_fill(
+            db,
+            run_id,
+            signal_id,
+            created_at,
+            m,
+            outcome,
+            token_id,
+            signal_type,
+            quote,
+            requested,
+            event_key,
+            candidate_key,
+            strategy_family,
+        )
     elif quote.get("execution_source") != "clob_book" or not quote.get("depth_sufficient"):
         reason = "no_executable_clob_depth"
     elif entry is None or entry <= 0.0:
@@ -4456,6 +4592,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--enable-wu", action="store_true", default=env_bool("ENABLE_WU", False), help="Attempt slow/best-effort Weather Underground station reads; default off for cron reliability")
     s.add_argument("--disable-ledger", action="store_true", help="Do not write simulated paper orders/fills/positions for this scan")
     s.add_argument("--allow-weak-families", action="store_true", help="Allow paper ledger fills for strategy families that have not passed the survival gate")
+    s.add_argument("--strict-survival-gate", action="store_true", help="Promote-only paper fills: block INCONCLUSIVE and CONTINUE_OBSERVING families as well as killed families")
     s.set_defaults(disable_weak_families=True)
     s.add_argument("--max-position-pct", type=float, default=float(os.environ.get("MAX_POSITION_PCT", "0.02")), help="Max simulated cash exposure per market position")
     s.add_argument("--max-city-date-pct", type=float, default=float(os.environ.get("MAX_CITY_DATE_PCT", "0.10")), help="Max simulated cash exposure per city/date")

@@ -171,13 +171,32 @@ class WeatherEdgeTests(unittest.TestCase):
             "forecast_distribution_directional",
         )
 
-    def test_paper_buy_survival_gate_disables_non_promoted_family_by_default(self):
-        args = argparse.Namespace(allow_weak_families=False, disable_weak_families=True)
+    def test_paper_buy_survival_gate_defaults_to_bootstrap_kill_only(self):
+        args = argparse.Namespace(allow_weak_families=False, disable_weak_families=True, strict_survival_gate=False)
         original = scanner.edge_validation.disabled_families
-        scanner.edge_validation.disabled_families = lambda _path: {"ladder_inconsistency"}
+        calls = []
+        def fake_disabled(_path, *, strict=False):
+            calls.append(strict)
+            return {"ladder_inconsistency"}
+        scanner.edge_validation.disabled_families = fake_disabled
         try:
             self.assertTrue(scanner.paper_buy_survival_gate_disabled(args, "ladder_inconsistency"))
             self.assertFalse(scanner.paper_buy_survival_gate_disabled(args, "forecast_distribution_directional"))
+            self.assertEqual(calls, [False])
+        finally:
+            scanner.edge_validation.disabled_families = original
+
+    def test_paper_buy_survival_gate_strict_mode_disables_non_promoted(self):
+        args = argparse.Namespace(allow_weak_families=False, disable_weak_families=True, strict_survival_gate=True)
+        original = scanner.edge_validation.disabled_families
+        calls = []
+        def fake_disabled(_path, *, strict=False):
+            calls.append(strict)
+            return {"latency_absorbing_state"}
+        scanner.edge_validation.disabled_families = fake_disabled
+        try:
+            self.assertTrue(scanner.paper_buy_survival_gate_disabled(args, "latency_absorbing_state"))
+            self.assertEqual(calls, [True])
         finally:
             scanner.edge_validation.disabled_families = original
 
@@ -648,7 +667,7 @@ class WeatherEdgeTests(unittest.TestCase):
                     self.assertIn(col, training_cols)
                 for col in ("event_key", "strategy_family"):
                     self.assertIn(col, position_cols)
-                for table in ("events", "contract_payouts", "event_exposure_snapshots", "lifecycle_attribution", "calibration_rows"):
+                for table in ("events", "contract_payouts", "event_exposure_snapshots", "lifecycle_attribution", "calibration_rows", "shadow_orders", "shadow_fills"):
                     self.assertIn(table, tables)
             finally:
                 db.close()
@@ -689,6 +708,53 @@ class WeatherEdgeTests(unittest.TestCase):
             self.assertTrue(records[0]["safety"]["paper_only"])
             self.assertFalse(records[0]["safety"]["live_trading"])
             self.assertFalse(records[0]["approval"]["order_placement"])
+
+    def test_survival_gated_family_records_shadow_fill_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+            args = argparse.Namespace(
+                disable_ledger=False,
+                paper_size=5.0,
+                min_fill_shares=1.0,
+                max_position_pct=0.50,
+                max_city_date_pct=0.50,
+                max_open_exposure_pct=0.50,
+                allow_weak_families=False,
+                disable_weak_families=True,
+                strict_survival_gate=False,
+                _paper_buy_disabled_families={"killed_family"},
+            )
+            scanner.simulate_paper_order(
+                db,
+                args,
+                run_id=1,
+                signal_id=2,
+                created_at="2026-05-09T00:00:00Z",
+                m={"market_id": "m1", "title": "Weather test"},
+                outcome="Yes",
+                token_id="tok1",
+                city="New York",
+                target_date="2026-05-09",
+                signal_type="paper_buy_edge",
+                quote={
+                    "entry_price": 0.40,
+                    "ask": 0.40,
+                    "depth": 10.0,
+                    "depth_sufficient": True,
+                    "execution_source": "clob_book",
+                    "raw_status": "ok",
+                },
+                event_key="event1",
+                candidate_key="cand1",
+                strategy_family="killed_family",
+            )
+            self.assertEqual(db.execute("select status, reason from paper_orders").fetchone(), ("skipped", "strategy_family_survival_gate_disabled"))
+            self.assertEqual(db.execute("select count(*) from paper_fills").fetchone()[0], 0)
+            self.assertEqual(db.execute("select count(*) from paper_positions").fetchone()[0], 0)
+            self.assertEqual(db.execute("select cash from paper_accounts where name=?", (scanner.DEFAULT_ACCOUNT_NAME,)).fetchone()[0], 1000.0)
+            self.assertEqual(db.execute("select shadow_reason, strategy_family from shadow_orders").fetchone(), ("survival_gate_disabled", "killed_family"))
+            self.assertEqual(db.execute("select shares, price, cost, source from shadow_fills").fetchone(), (5.0, 0.40, 2.0, "clob_book"))
+            db.close()
 
     def test_no_live_trading_guard_blocks_prohibited_options(self):
         self.assertTrue(scanner.ensure_paper_only_guard(argparse.Namespace()))

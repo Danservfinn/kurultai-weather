@@ -18,6 +18,9 @@ RESOLVED_TARGET = 300
 DAY_TARGET = 14
 FRESH_QUOTE_SECONDS = 900
 MIN_RESOLVED_FOR_KILL = 50
+MIN_FILLS_FOR_PROMOTION = 30
+MIN_CLOB_FILL_RATE_FOR_PROMOTION = 0.50
+MAX_DISPLAYED_PRICE_FILL_RATE_FOR_PROMOTION = 0.10
 SURVIVAL_WEIGHTS = {
     "pnl_quality": 0.25,
     "calibration_advantage": 0.20,
@@ -78,6 +81,18 @@ def brier(prob: float | None, label: float | None) -> float | None:
     if prob is None or label is None:
         return None
     return (clamp(float(prob)) - clamp(float(label))) ** 2
+
+def quote_is_fresh(row: sqlite3.Row | dict[str, Any]) -> bool:
+    quote_age = get_value(row, "quote_age_seconds")
+    if quote_age is None:
+        return False
+    try:
+        age = float(quote_age)
+    except (TypeError, ValueError):
+        return False
+    execution_source = str(get_value(row, "execution_source", default="clob_book") or "clob_book")
+    return not bool(get_value(row, "stale_book_flag", default=0)) and age <= FRESH_QUOTE_SECONDS and execution_source == "clob_book"
+
 
 def read_fills_by_candidate(db: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
     if not (table_exists(db, "paper_fills") and table_exists(db, "paper_orders")):
@@ -168,8 +183,22 @@ def verdict_for(row: dict[str, Any]) -> str:
     persistence = float(row.get("edge_decile_persistence") or 0.0)
     ambiguity_control = float(row.get("ambiguity_control") or 0.0)
     execution_realism = float(row.get("execution_realism") or 0.0)
+    fills = int(row.get("fills") or 0)
+    clob_fill_rate = float(row.get("clob_fill_rate") or 0.0)
+    displayed_price_fill_rate = float(row.get("displayed_price_fill_rate") or 0.0)
     score = float(row.get("survival_score") or 0.0)
-    if resolved >= RESOLVED_TARGET and sample_days >= DAY_TARGET and pnl > 0.0 and brier_delta > 0.0 and persistence >= 0.50 and ambiguity_control >= 0.80 and score >= 0.60:
+    if (
+        resolved >= RESOLVED_TARGET
+        and sample_days >= DAY_TARGET
+        and fills >= MIN_FILLS_FOR_PROMOTION
+        and clob_fill_rate >= MIN_CLOB_FILL_RATE_FOR_PROMOTION
+        and displayed_price_fill_rate <= MAX_DISPLAYED_PRICE_FILL_RATE_FOR_PROMOTION
+        and pnl > 0.0
+        and brier_delta > 0.0
+        and persistence >= 0.50
+        and ambiguity_control >= 0.80
+        and score >= 0.60
+    ):
         return PROMOTE_PAPER_SIZE
     if resolved < MIN_RESOLVED_FOR_KILL:
         return INCONCLUSIVE
@@ -198,20 +227,26 @@ def evaluate_strategy_families(db_path: str = DEFAULT_DB_PATH, *, persist: bool 
         if not cost_basis and family in fills_by_family:
             cost_basis = sum(float(r["cost"] or 0.0) for r in fills_by_family[family])
         model_briers = [v for v in (brier(get_value(r, "model_prob"), get_value(r, "label_value")) for r in resolved_rows) if v is not None]
-        market_briers = [v for v in (brier(get_value(r, "entry_price", "market_prob"), get_value(r, "label_value")) for r in resolved_rows) if v is not None]
+        market_briers = [v for v in (brier(get_value(r, "market_prob"), get_value(r, "label_value")) for r in resolved_rows) if v is not None]
+        entry_price_briers = [v for v in (brier(get_value(r, "entry_price"), get_value(r, "label_value")) for r in resolved_rows) if v is not None]
         model_brier = sum(model_briers) / len(model_briers) if model_briers else 0.0
         market_brier = sum(market_briers) / len(market_briers) if market_briers else 0.0
+        entry_price_brier_diagnostic = sum(entry_price_briers) / len(entry_price_briers) if entry_price_briers else 0.0
         brier_delta = market_brier - model_brier
         deciles, persistence = edge_deciles(resolved_rows)
         decile_records[family] = deciles
         filled_orders = int(order_counts[family]["filled_orders"])
         orders = int(order_counts[family]["orders"])
         fills = len(fills_by_family.get(family, []))
+        clob_fills = sum(1 for r in fills_by_family.get(family, []) if str(r["source"] or "") == "clob_book")
+        displayed_price_fills = sum(1 for r in fills_by_family.get(family, []) if str(r["source"] or "") != "clob_book")
+        clob_fill_rate = clamp(safe_div(clob_fills, fills)) if fills else 0.0
+        displayed_price_fill_rate = clamp(safe_div(displayed_price_fills, fills)) if fills else 0.0
         signal_count = len(family_signals)
         fill_den = orders or signal_count or len(family_training)
         fill_rate = clamp(safe_div(filled_orders or fills, fill_den))
         quote_rows = family_signals or family_training
-        fresh = [r for r in quote_rows if not bool(get_value(r, "stale_book_flag", default=0)) and float(get_value(r, "quote_age_seconds", default=0) or 0) <= FRESH_QUOTE_SECONDS]
+        fresh = [r for r in quote_rows if quote_is_fresh(r)]
         fresh_quote_rate = clamp(safe_div(len(fresh), len(quote_rows))) if quote_rows else 0.0
         depth_ok = [r for r in quote_rows if bool(get_value(r, "depth_sufficient", default=0))]
         depth_sufficient_rate = clamp(safe_div(len(depth_ok), len(quote_rows))) if quote_rows else 0.0
@@ -224,8 +259,10 @@ def evaluate_strategy_families(db_path: str = DEFAULT_DB_PATH, *, persist: bool 
             "strategy_family": family, "candidates": len(family_training), "signals": signal_count, "fills": fills,
             "resolved_count": len(resolved_rows), "sample_days": len(dates), "realized_pnl": pnl,
             "cost_basis": cost_basis, "roi": roi, "model_brier": model_brier, "market_brier": market_brier,
+            "entry_price_brier_diagnostic": entry_price_brier_diagnostic,
             "brier_delta": brier_delta, "edge_decile_persistence": persistence, "execution_realism": execution_realism,
-            "fill_rate": fill_rate, "fresh_quote_rate": fresh_quote_rate, "depth_sufficient_rate": depth_sufficient_rate,
+            "fill_rate": fill_rate, "clob_fill_rate": clob_fill_rate, "displayed_price_fill_rate": displayed_price_fill_rate,
+            "fresh_quote_rate": fresh_quote_rate, "depth_sufficient_rate": depth_sufficient_rate,
             "sample_adequacy": sample_adequacy, "ambiguity_control": ambiguity_control,
             "pnl_quality": clamp(roi), "calibration_advantage": clamp(brier_delta * 4.0),
         }
@@ -270,11 +307,13 @@ def persist_results(db: sqlite3.Connection, rows: list[dict[str, Any]], deciles:
             db.execute("insert into strategy_family_edge_deciles values(?,?,?,?,?,?,?)", (family, evaluated_at, decile["decile"], decile["rows"], decile["mean_edge"], decile["realized_return"], decile["win_rate"]))
 
 
-def disabled_families(db_path: str = DEFAULT_DB_PATH) -> set[str]:
+def disabled_families(db_path: str = DEFAULT_DB_PATH, *, strict: bool = False) -> set[str]:
     # This helper runs inside the scanner's paper-order path while the scan
     # already owns the SQLite write connection. Keep it read-only to avoid
     # self-locking the paper DB; dashboard/CLI calls can persist snapshots.
-    return {str(r["strategy_family"]) for r in evaluate_strategy_families(db_path, persist=False) if r["verdict"] != PROMOTE_PAPER_SIZE}
+    if strict:
+        return {str(r["strategy_family"]) for r in evaluate_strategy_families(db_path, persist=False) if r["verdict"] != PROMOTE_PAPER_SIZE}
+    return {str(r["strategy_family"]) for r in evaluate_strategy_families(db_path, persist=False) if r["verdict"] == KILL_OR_DISABLE}
 
 def json_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"schema_version": 1, "generated_at": utc_now_iso(), "mode": "strategy_family_survival", "thresholds": {"resolved_target": RESOLVED_TARGET, "day_target": DAY_TARGET}, "weights": SURVIVAL_WEIGHTS, "rows": rows}
