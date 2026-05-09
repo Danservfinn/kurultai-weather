@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local databases and generated state
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+tuning_iterations.jsonl
+report.html
+weather-frontend*.log
+*.log
+
+# Local backups / generated artifacts
+backups/
+*.bak.*
+*.baseline.*
+/tmp/
+
+# Secrets and local env
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.p8
+secrets/
+credentials*
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

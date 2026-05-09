@@ -1,0 +1,86 @@
+# Paper-only optimization goal scaffold.
+# The tune command only proposes candidate config values from historical paper
+# data; it does not deploy, trade, place orders, sign transactions, or load
+# wallets.
+name: paper_weather_edge_v1
+mode: paper_only
+paper_only: true
+primary_metric: realized_return_pct
+secondary_metrics: brier_score, max_drawdown, unresolved_rate
+minimum_training_rows: 300
+minimum_labeled_rows: 300
+minimum_calendar_days: 14
+validation_method: date_walk_forward
+promotion: propose_only
+guardrails:
+  live_trading: false
+  wallet_required: false
+  order_placement: false
+  displayed_price_fills: false
+  require_executable_clob_depth: true
+  max_drawdown: 0.20
+  max_position_pct: 0.02
+  max_city_date_pct: 0.10
+  live_money_deployment: false
+runtime_config: /Users/kublai/polymarket-weather-edge/runtime_tunables.env
+cron_job_id: 4500a64f8da1
+current_runtime:
+  scan_interval_minutes: 15
+  dashboard_poll_seconds: 30
+  scan_pause_seconds: 0.01
+  enable_wu: false
+  enable_nws: false
+  enable_iem: false
+  enable_ncei_daily: false
+  enable_meteostat: false
+  enable_metar_direct: false
+  enable_om_models: false
+  allow_paid_provider_features: false
+allowed_tunables:
+  # Scheduling/display knobs. Goal seeking may propose changes, but cron updates
+  # remain proposal-only and must preserve paper-only mode.
+  scan_interval_minutes: [5, 10, 15, 30, 60, 120]
+  dashboard_poll_seconds: [15, 30, 60]
+  # Data-collection/execution-simulation knobs.
+  scan_pause_seconds: [0.01, 0.05, 0.10, 0.20]
+  market_metadata_cache_ttl_seconds: [300, 900, 1800, 3600]
+  forecast_cache_ttl_seconds: [900, 1800, 3600, 7200]
+  observation_cache_ttl_seconds: [120, 300, 600, 900]
+  orderbook_cache_ttl_seconds: [15, 30, 60, 120]
+  http_timeout_seconds: [4, 6, 8, 12]
+  source_backoff_minutes: [5, 15, 30, 60]
+  per_source_daily_call_budget: [100, 250, 500, 1000]
+  sigma: [2.5, 3.5, 4.5]
+  sigma_by_model_spread_multiplier: [0.5, 1.0, 1.5, 2.0]
+  edge_threshold: [0.06, 0.08, 0.10, 0.12]
+  edge_threshold_touched: [0.02, 0.04, 0.06, 0.08]
+  edge_threshold_ambiguous_station: [0.10, 0.12, 0.15, 0.20]
+  max_spread: [0.08, 0.10, 0.12]
+  max_slippage: [0.01, 0.02, 0.03, 0.05]
+  min_entry: [0.01, 0.02, 0.03, 0.05]
+  max_entry: [0.90, 0.95]
+  paper_size_shares: [2.0, 5.0, 10.0]
+  min_fill_shares: [1.0, 2.0, 5.0]
+  min_top_of_book_depth: [1.0, 2.0, 5.0, 10.0]
+  stale_book_max_age_seconds: [30, 60, 120, 300]
+  max_position_pct: [0.005, 0.01, 0.02]
+  max_city_date_pct: [0.05, 0.10]
+  max_station_date_pct: [0.05, 0.10]
+  max_ladder_group_pct: [0.05, 0.10]
+  max_open_exposure_pct: [0.20, 0.30, 0.50]
+  min_station_confidence_for_buy: [0.50, 0.60, 0.75]
+  station_distance_penalty_per_mile: [0.001, 0.002, 0.005]
+  elevation_delta_penalty_per_100ft: [0.001, 0.002, 0.005]
+  unknown_station_edge_haircut: [0.02, 0.04, 0.08]
+  ambiguous_rule_edge_haircut: [0.02, 0.04, 0.08]
+  missingness_penalty: [0.01, 0.03, 0.05]
+  source_disagreement_threshold_f: [2.0, 4.0, 6.0]
+  source_weight_open_meteo: [0.50, 0.75, 1.00]
+  source_weight_nws: [0.00, 0.25, 0.50]
+  source_weight_iem: [0.00, 0.25, 0.50]
+  source_weight_wu: [0.00, 0.25, 0.50]
+  source_weight_ncei: [0.00, 0.25, 0.50]
+  paper_forward_min_labeled_rows: [300, 500, 1000]
+  paper_forward_min_calendar_days: [14, 30, 60]
+  paper_forward_max_drawdown: [0.10, 0.15, 0.20]
+  paper_forward_min_feature_coverage: [0.70, 0.80, 0.90]
