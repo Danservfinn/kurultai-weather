@@ -271,7 +271,10 @@ def persist_results(db: sqlite3.Connection, rows: list[dict[str, Any]], deciles:
 
 
 def disabled_families(db_path: str = DEFAULT_DB_PATH) -> set[str]:
-    return {str(r["strategy_family"]) for r in evaluate_strategy_families(db_path, persist=True) if r["verdict"] != PROMOTE_PAPER_SIZE}
+    # This helper runs inside the scanner's paper-order path while the scan
+    # already owns the SQLite write connection. Keep it read-only to avoid
+    # self-locking the paper DB; dashboard/CLI calls can persist snapshots.
+    return {str(r["strategy_family"]) for r in evaluate_strategy_families(db_path, persist=False) if r["verdict"] != PROMOTE_PAPER_SIZE}
 
 def json_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"schema_version": 1, "generated_at": utc_now_iso(), "mode": "strategy_family_survival", "thresholds": {"resolved_target": RESOLVED_TARGET, "day_target": DAY_TARGET}, "weights": SURVIVAL_WEIGHTS, "rows": rows}
