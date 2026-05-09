@@ -11,7 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-FEATURE_SCHEMA_VERSION = 1
+FEATURE_SCHEMA_VERSION = 2
 
 FEATURE_FAMILIES: dict[str, str] = {
     "settlement_source": "Settlement source/station confidence",
@@ -22,6 +22,7 @@ FEATURE_FAMILIES: dict[str, str] = {
     "ladder_consistency": "Cross-outcome ladder consistency",
     "source_quality": "Source quality and missingness",
     "portfolio_risk": "Portfolio and risk context",
+    "event_model": "Event key, latent final-high distribution, and payout mapping",
     "no_lookahead": "Label separation and timestamp gate",
 }
 
@@ -328,6 +329,7 @@ def build_decision_features(
         "paper_fill_shares": orderbook.get("fill_shares") or depth,
         "paper_slippage": None if entry_price is None or ask is None else entry_price - ask,
         "paper_fill_source": orderbook.get("execution_source"),
+        "quote_age_seconds": to_float(orderbook.get("quote_age_seconds")),
         "depth_sufficient_flag": to_bool_int(orderbook.get("depth_sufficient")),
         "stale_book_flag": to_bool_int(orderbook.get("stale_book_flag")),
         "wide_spread_flag": to_bool_int(spread is not None and spread > float(tunables.get("max_spread") or 0.12)),
@@ -363,6 +365,16 @@ def build_decision_features(
         "drawdown_pct": portfolio.get("drawdown") or portfolio.get("drawdown_pct"),
     }
 
+    event_group = {
+        "event_key": market.get("event_key"),
+        "strategy_family": market.get("strategy_family"),
+        "contract_type": market.get("contract_type"),
+        "settlement_state": market.get("settlement_state"),
+        "latent_final_high_mean_f": forecast.get("latent_final_high_mean_f") or forecast_high,
+        "latent_final_high_sigma_f": forecast.get("latent_final_high_sigma_f") or forecast.get("ensemble_high_std_f"),
+        "contract_payout_mapping_hash": stable_hash(market.get("payout_mapping_json") or market.get("payout_mapping")),
+    }
+
     source_statuses = [record.get("status") for record in source_records if record.get("status")]
     source_quality = {
         "source_fetch_status": observation.get("raw_status") or forecast.get("raw_status") or orderbook.get("raw_status"),
@@ -384,6 +396,7 @@ def build_decision_features(
         "microstructure": microstructure,
         "ladder_consistency": ladder_group,
         "portfolio_risk": portfolio_group,
+        "event_model": event_group,
         "source_quality": source_quality,
     }
     mask = missing_mask(groups)

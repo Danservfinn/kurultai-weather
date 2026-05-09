@@ -5,8 +5,8 @@
 name: paper_weather_edge_v1
 mode: paper_only
 paper_only: true
-primary_metric: realized_return_pct
-secondary_metrics: brier_score, max_drawdown, unresolved_rate
+primary_metric: calibration_brier_log_loss
+secondary_metrics: realized_return_pct, max_drawdown, unresolved_rate
 minimum_training_rows: 300
 minimum_labeled_rows: 300
 minimum_calendar_days: 14

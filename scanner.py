@@ -26,6 +26,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import features
+import settlement_states
 import tuning_evaluator
 import weather_sources
 
@@ -94,12 +95,27 @@ TRAINING_EXPORT_COLUMNS = [
     "uncertainty_margin",
     "ease_score",
     "signal_type",
+    "strategy_family",
+    "event_key",
+    "contract_type",
+    "settlement_state",
     "reason",
     "label_status",
     "label_value",
     "label_source",
     "labeled_at",
 ]
+STRATEGY_FAMILIES = {
+    "latency_absorbing_state",
+    "complement_arb",
+    "ladder_inconsistency",
+    "settlement_source_edge",
+    "diurnal_nowcast",
+    "forecast_distribution_directional",
+    "watch",
+    "skip",
+    "unknown",
+}
 PROHIBITED_LIVE_ARG_NAMES = (
     "live_trading",
     "live_trade",
@@ -118,8 +134,8 @@ DEFAULT_GOAL_TEXT = """# Paper-only optimization goal scaffold.
 name: paper_weather_edge_v1
 mode: paper_only
 paper_only: true
-primary_metric: realized_return_pct
-secondary_metrics: brier_score, max_drawdown, unresolved_rate
+primary_metric: calibration_brier_log_loss
+secondary_metrics: realized_return_pct, max_drawdown, unresolved_rate
 minimum_training_rows: 300
 minimum_labeled_rows: 300
 minimum_calendar_days: 14
@@ -830,23 +846,11 @@ def bucket_state_from_observation(
     target_date: str | None = None,
     local_date: str | None = None,
 ) -> str:
-    if bucket is None:
-        return "ambiguous"
-    if observed_high_f is None:
-        return "source_missing"
-    target = parse_iso_date(target_date)
-    local = parse_iso_date(local_date)
-    day_complete = bool(target and local and local > target)
-    if day_complete:
-        return "already_won" if high_within_bucket(observed_high_f, bucket) else "already_lost"
-    if bucket.hi != math.inf and observed_high_f > bucket.hi:
-        return "already_lost"
-    if bucket.hi == math.inf and observed_high_f >= bucket.lo:
-        return "already_won"
-    if bucket.lo != -math.inf and observed_high_f < bucket.lo:
+    state = settlement_state_for_bucket(bucket, observed_high_f, "Yes", target_date, local_date)
+    if state.state == settlement_states.STATE_STILL_POSSIBLE and bucket is not None and observed_high_f is not None and bucket.lo != -math.inf and observed_high_f < bucket.lo:
         gap = bucket.lo - observed_high_f
         return "unlikely_but_possible" if gap >= 10.0 else "still_possible"
-    return "still_possible"
+    return settlement_states.legacy_bucket_state(state)
 
 
 def threshold_status_from_bucket_state(state: str) -> str:
@@ -874,6 +878,101 @@ def apply_intraday_probability(base_prob: float, status: str) -> float:
     if status in ("impossible_now", "already_lost"):
         return 0.0
     return base_prob
+
+
+def outcome_side(outcome: str | None) -> str:
+    return "no" if str(outcome or "").strip().lower() in {"no", "n"} else "yes"
+
+
+def contract_spec_for_bucket(bucket: BucketSpec | None, outcome: str | None = None) -> settlement_states.ContractSpec:
+    if bucket is None:
+        return settlement_states.ContractSpec(settlement_states.CONTRACT_UNKNOWN, outcome_side(outcome), label=str(outcome or ""))
+    return settlement_states.classify_contract(
+        bucket.kind,
+        finite_or_none(bucket.lo),
+        finite_or_none(bucket.hi),
+        side=outcome_side(outcome),
+        label=bucket.label,
+    )
+
+
+def settlement_state_for_bucket(
+    bucket: BucketSpec | None,
+    observed_high_f: float | None,
+    outcome: str | None = None,
+    target_date: str | None = None,
+    local_date: str | None = None,
+) -> settlement_states.SettlementState:
+    target = parse_iso_date(target_date)
+    local = parse_iso_date(local_date)
+    local_day_complete = bool(target and local and local > target)
+    spec = contract_spec_for_bucket(bucket, outcome)
+    return settlement_states.settlement_state(spec, observed_high_f, local_day_complete=local_day_complete)
+
+
+def payout_mapping_for_contract(spec: settlement_states.ContractSpec) -> dict[str, Any]:
+    if spec.contract_type == settlement_states.CONTRACT_THRESHOLD:
+        if spec.threshold_direction == "gte":
+            condition = f"final_high_f >= {spec.threshold_f:g}" if spec.threshold_f is not None else "threshold_missing"
+        elif spec.threshold_direction == "lte":
+            condition = f"final_high_f <= {spec.threshold_f:g}" if spec.threshold_f is not None else "threshold_missing"
+        else:
+            condition = "threshold_unknown"
+    elif spec.contract_type == settlement_states.CONTRACT_EXACT:
+        condition = f"{spec.low_f:g} <= final_high_f <= {spec.high_f:g}" if spec.low_f is not None and spec.high_f is not None else "exact_bounds_missing"
+    elif spec.contract_type == settlement_states.CONTRACT_RANGE:
+        condition = f"{spec.low_f:g} <= final_high_f <= {spec.high_f:g}" if spec.low_f is not None and spec.high_f is not None else "range_bounds_missing"
+    else:
+        condition = "unclassified_contract"
+    return {
+        "contract_type": spec.contract_type,
+        "side": spec.side,
+        "yes_condition": condition,
+        "payout_if_condition_true": 0.0 if spec.side == "no" else 1.0,
+        "payout_if_condition_false": 1.0 if spec.side == "no" else 0.0,
+        "threshold_f": spec.threshold_f,
+        "low_f": spec.low_f,
+        "high_f": spec.high_f,
+        "threshold_direction": spec.threshold_direction,
+    }
+
+
+def normalized_key_part(value: Any, fallback: str = "unknown") -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text or fallback
+
+
+def event_key_for(
+    city: str | None,
+    target_date: str | None,
+    source: str | None,
+    station_id: str | None,
+    rule_text: str | None,
+) -> str:
+    """Stable event key by city/date/source/station/rule material."""
+    city_part = normalized_key_part(city, "unknown-city")
+    date_part = normalized_key_part(target_date, "unknown-date")
+    source_part = normalized_key_part(source, "unknown-source")
+    station_part = normalized_key_part(str(station_id or "").upper(), "unknown-station")
+    rule_hash = features.stable_hash(rule_text or "") or "no-rule"
+    return f"{city_part}|{date_part}|{source_part}|{station_part}|{rule_hash}"
+
+
+def event_rule_text(market: dict[str, Any], bucket: BucketSpec | None = None) -> str:
+    pieces = [
+        market.get("rules_text"),
+        market.get("resolution_text"),
+        market.get("source_text"),
+        bucket.kind if bucket else None,
+        bucket.label if bucket else None,
+    ]
+    return " ".join(str(piece) for piece in pieces if piece)
+
+
+def candidate_key_for(event_key: str | None, market_id: str | None, outcome: str | None, token_id: str | None, created_at: str | None) -> str:
+    raw = "|".join(str(value or "") for value in (event_key, market_id, outcome, token_id, created_at))
+    return features.stable_hash(raw) or normalized_key_part(raw, "candidate")
 
 
 def fetch_clob_book(token_id: str | None) -> dict[str, Any] | None:
@@ -927,6 +1026,19 @@ def depth_within_price(levels: list[tuple[float, float]], max_price: float | Non
     return sum(size for price, size in levels if price <= max_price)
 
 
+def quote_age_seconds_from_book(book: dict[str, Any] | None) -> float | None:
+    if not isinstance(book, dict):
+        return None
+    timestamp = book.get("timestamp") or book.get("updated_at") or book.get("created_at")
+    if isinstance(book.get("book"), dict):
+        nested = book["book"]
+        timestamp = timestamp or nested.get("timestamp") or nested.get("updated_at") or nested.get("created_at")
+    parsed = features.parse_time(timestamp)
+    if parsed is None:
+        return 0.0
+    return max(0.0, (dt.datetime.now(dt.timezone.utc) - parsed).total_seconds())
+
+
 def quote_from_book(book: dict[str, Any] | None, displayed_price: float | None, paper_size: float) -> dict[str, Any]:
     if not book:
         return {
@@ -939,8 +1051,11 @@ def quote_from_book(book: dict[str, Any] | None, displayed_price: float | None, 
             "depth_near_ask": None,
             "depth_sufficient": False,
             "midpoint": None,
+            "quote_age_seconds": None,
+            "stale_book_flag": True,
             "raw_status": "book_missing",
         }
+    quote_age = quote_age_seconds_from_book(book)
     if isinstance(book.get("book"), dict):
         book = book["book"]
     bids = parse_book_side(book.get("bids"), reverse=True)
@@ -962,6 +1077,8 @@ def quote_from_book(book: dict[str, Any] | None, displayed_price: float | None, 
         "depth_near_ask": depth_within_price(asks, near_ask_limit),
         "depth_sufficient": depth_sufficient,
         "midpoint": midpoint,
+        "quote_age_seconds": quote_age,
+        "stale_book_flag": bool(quote_age is not None and quote_age > float(os.environ.get("STALE_BOOK_MAX_AGE_SECONDS", "60"))),
         "raw_status": "ok" if depth_sufficient else ("partial_depth" if avg_ask is not None else "no_asks"),
     }
 
@@ -1184,7 +1301,184 @@ def required_edge_v2(
     return max(base, source_risk, liquidity_haircut)
 
 
+def detect_complement_arbitrage(
+    rows: list[dict[str, Any]],
+    *,
+    payout: float = 1.0,
+    margin: float = 0.01,
+    min_depth: float = 1.0,
+    max_quote_age_seconds: float = 60.0,
+) -> dict[str, Any]:
+    """Detect same-market YES/NO underround from executable asks only."""
+    by_side: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        side = outcome_side(row.get("outcome"))
+        if str(row.get("outcome") or "").strip().lower() in {"yes", "y", "no", "n"}:
+            by_side[side] = row
+    yes = by_side.get("yes")
+    no = by_side.get("no")
+    if not yes or not no:
+        return {"status": "not_binary_pair", "is_arb": False, "strategy_family": "unknown"}
+    yes_ask = yes.get("ask")
+    no_ask = no.get("ask")
+    if yes_ask is None or no_ask is None:
+        return {"status": "missing_executable_ask", "is_arb": False, "strategy_family": "unknown"}
+    yes_depth = float(yes.get("depth") or 0.0)
+    no_depth = float(no.get("depth") or 0.0)
+    yes_age = yes.get("quote_age_seconds")
+    no_age = no.get("quote_age_seconds")
+    stale = any(age is not None and float(age) > max_quote_age_seconds for age in (yes_age, no_age))
+    thin = yes_depth + 1e-9 < min_depth or no_depth + 1e-9 < min_depth
+    ask_sum = float(yes_ask) + float(no_ask)
+    edge = payout - ask_sum - margin
+    if stale:
+        status = "stale_quote"
+    elif thin:
+        status = "insufficient_depth"
+    elif edge > 0:
+        status = "complement_arb"
+    else:
+        status = "no_arb"
+    return {
+        "status": status,
+        "is_arb": status == "complement_arb",
+        "strategy_family": "complement_arb" if status == "complement_arb" else "unknown",
+        "yes_ask": float(yes_ask),
+        "no_ask": float(no_ask),
+        "ask_sum": ask_sum,
+        "payout": payout,
+        "margin": margin,
+        "edge_after_margin": edge,
+        "min_depth": min(yes_depth, no_depth),
+        "max_quote_age_seconds": max(float(age or 0.0) for age in (yes_age, no_age)),
+        "candidate_trade": "buy_yes_and_no" if status == "complement_arb" else None,
+    }
+
+
+def bucket_midpoint_for_row(row: dict[str, Any]) -> float:
+    spec = parse_bucket(str(row.get("outcome", "")))
+    if spec and math.isfinite(spec.lo) and math.isfinite(spec.hi):
+        return (spec.lo + spec.hi) / 2.0
+    lo = row.get("bucket_lo_f")
+    hi = row.get("bucket_hi_f")
+    if lo is not None and hi is not None and math.isfinite(float(lo)) and math.isfinite(float(hi)):
+        return (float(lo) + float(hi)) / 2.0
+    return float("inf")
+
+
+def ladder_monitor(
+    rows: list[dict[str, Any]],
+    *,
+    min_depth: float = 1.0,
+    max_quote_age_seconds: float = 60.0,
+) -> dict[str, Any]:
+    usable = [r for r in rows if r.get("entry_price") is not None or r.get("ask") is not None or r.get("bid") is not None]
+    if not usable:
+        return {
+            "status": "ladder_missing",
+            "violations": ["ladder_missing"],
+            "implied_distribution": [],
+            "candidate_correction_trade": None,
+        }
+    ask_sum = sum(float(r["ask"]) for r in usable if r.get("ask") is not None)
+    bid_sum = sum(float(r["bid"]) for r in usable if r.get("bid") is not None)
+    market_sum = sum(float(r["entry_price"]) for r in usable if r.get("entry_price") is not None)
+    model_sum = sum(float(r["model_prob"]) for r in usable if r.get("model_prob") is not None)
+    violations: list[str] = []
+    if ask_sum and ask_sum < 0.98:
+        violations.append("ask_sum_under_one")
+    if bid_sum and bid_sum > 1.02:
+        violations.append("bid_sum_over_one")
+    if market_sum > 1.08:
+        violations.append("probability_sum_high")
+    elif market_sum and market_sum < 0.92:
+        violations.append("probability_sum_low")
+    if any(float(r.get("quote_age_seconds") or 0.0) > max_quote_age_seconds for r in usable):
+        violations.append("stale_linked_outcome")
+    if any(float(r.get("depth") or 0.0) + 1e-9 < min_depth for r in usable if r.get("ask") is not None):
+        violations.append("thin_linked_outcome")
+
+    ordered = sorted(usable, key=bucket_midpoint_for_row)
+    for a, b in zip(ordered, ordered[1:]):
+        if a.get("entry_price") is not None and b.get("entry_price") is not None and abs(float(a["entry_price"]) - float(b["entry_price"])) >= 0.30:
+            violations.append("adjacent_discontinuity")
+            break
+    for row in ordered:
+        state = str(row.get("bucket_state") or "")
+        entry = row.get("entry_price")
+        if entry is None:
+            continue
+        if state == "already_lost" and float(entry) >= 0.05:
+            violations.append("impossible_bucket_priced")
+            break
+        if state == "already_won" and float(entry) <= 0.95:
+            violations.append("absorbing_bucket_discount")
+            break
+
+    correction = None
+    best = None
+    for row in ordered:
+        if row.get("model_prob") is None or row.get("entry_price") is None:
+            continue
+        edge = float(row["model_prob"]) - float(row["entry_price"])
+        if best is None or edge > best[0]:
+            best = (edge, row)
+    if best and best[0] >= 0.12:
+        correction = {
+            "action": "buy_underpriced_bucket",
+            "outcome": best[1].get("outcome"),
+            "edge": best[0],
+            "entry_price": best[1].get("entry_price"),
+            "model_prob": best[1].get("model_prob"),
+        }
+        if "underpriced_bucket" not in violations:
+            violations.append("underpriced_bucket")
+    if ask_sum and ask_sum < 0.98:
+        correction = correction or {"action": "buy_full_ladder_underround", "ask_sum": ask_sum, "edge": 1.0 - ask_sum}
+
+    distribution = [
+        {
+            "outcome": row.get("outcome"),
+            "implied_prob": row.get("entry_price"),
+            "model_prob": row.get("model_prob"),
+            "ask": row.get("ask"),
+            "bid": row.get("bid"),
+            "depth": row.get("depth"),
+            "quote_age_seconds": row.get("quote_age_seconds"),
+        }
+        for row in ordered
+    ]
+    return {
+        "status": "ladder_violation" if violations else "ladder_ok",
+        "violations": sorted(set(violations)) or ["ladder_ok"],
+        "ask_sum": ask_sum or None,
+        "bid_sum": bid_sum or None,
+        "market_sum": market_sum,
+        "model_sum": model_sum,
+        "implied_distribution": distribution,
+        "candidate_correction_trade": correction,
+    }
+
+
 def ladder_diagnostics(rows: list[dict[str, Any]]) -> str:
+    structured = ladder_monitor(rows)
+    if structured.get("status") == "ladder_missing":
+        return "ladder_missing"
+    notes = [v for v in structured.get("violations", []) if v != "ladder_ok"]
+    if not notes:
+        notes.append("ladder_ok")
+    if structured.get("market_sum") is not None:
+        notes.append(f"market_sum={float(structured['market_sum']):.3f}")
+    if structured.get("model_sum") is not None:
+        notes.append(f"model_sum={float(structured['model_sum']):.3f}")
+    if structured.get("ask_sum"):
+        notes.append(f"ask_sum={float(structured['ask_sum']):.3f}")
+    if structured.get("bid_sum"):
+        notes.append(f"bid_sum={float(structured['bid_sum']):.3f}")
+    return "; ".join(notes)
+
+
+def legacy_ladder_diagnostics(rows: list[dict[str, Any]]) -> str:
     usable = [r for r in rows if r.get("entry_price") is not None and r.get("model_prob") is not None]
     if not usable:
         return "ladder_missing"
@@ -1285,8 +1579,45 @@ def classify_signal(
     return "paper_buy_forecast_distribution", "passes paper filters"
 
 
+def classify_strategy_family(
+    signal_type: str | None,
+    *,
+    bucket_state: str | None = None,
+    settlement_state: str | None = None,
+    ladder_status: str | None = None,
+    complement_status: str | None = None,
+    source_confidence: str | None = None,
+    eligibility_class: str | None = None,
+    observed_high_f: float | None = None,
+) -> str:
+    raw_signal = str(signal_type or "").strip().lower()
+    if raw_signal.startswith("skip"):
+        return "skip"
+    if raw_signal.startswith("watch"):
+        return "watch"
+    if complement_status == "complement_arb" or "complement_arb" in raw_signal:
+        return "complement_arb"
+    if ladder_status == "ladder_violation" or "ladder" in raw_signal:
+        return "ladder_inconsistency"
+    if bucket_state in {"already_won", "already_lost"} or settlement_state in {
+        settlement_states.STATE_YES_CERTAIN,
+        settlement_states.STATE_NO_CERTAIN,
+        settlement_states.STATE_YES_IMPOSSIBLE,
+        settlement_states.STATE_NO_IMPOSSIBLE,
+    }:
+        return "latency_absorbing_state"
+    if source_confidence == "medium" or eligibility_class in {"unclear_source", "unclear_station", "ambiguous_resolution"}:
+        return "settlement_source_edge"
+    if observed_high_f is not None:
+        return "diurnal_nowcast"
+    if raw_signal.startswith("paper_buy"):
+        return "forecast_distribution_directional"
+    return "unknown"
+
+
 def init_db(path: str) -> sqlite3.Connection:
-    db = sqlite3.connect(path)
+    db = sqlite3.connect(path, timeout=30.0)
+    db.execute("pragma busy_timeout=30000")
     db.executescript(
         """
         create table if not exists runs (
@@ -1385,6 +1716,43 @@ def init_db(path: str) -> sqlite3.Connection:
           realized_pnl real not null, unrealized_pnl real not null, equity real not null,
           return_pct real not null, drawdown real not null, unresolved_positions integer not null
         );
+        create table if not exists events (
+          event_key text primary key, city text, target_date text, source text,
+          station_id text, rule_hash text, first_seen text not null,
+          last_seen text not null, latent_final_high_mean_f real,
+          latent_final_high_sigma_f real, observed_high_f real,
+          local_day_complete integer, contract_count integer,
+          open_exposure real, open_position_count integer, source_disagreement_f real
+        );
+        create table if not exists contract_payouts (
+          id integer primary key, event_key text not null, market_id text,
+          outcome text, token_id text, contract_type text, side text,
+          bucket_lo_f real, bucket_hi_f real, threshold_f real,
+          payout_mapping_json text, created_at text not null
+        );
+        create table if not exists event_exposure_snapshots (
+          id integer primary key, event_key text not null, captured_at text not null,
+          open_exposure real, open_value real, open_position_count integer,
+          latent_final_high_mean_f real, latent_final_high_sigma_f real,
+          observed_high_f real, local_day_complete integer,
+          source_disagreement_f real
+        );
+        create table if not exists lifecycle_attribution (
+          id integer primary key, candidate_key text not null,
+          event_key text, strategy_family text, market_id text, outcome text,
+          signal_id integer, training_row_id integer, order_id integer,
+          fill_id integer, position_id integer, label_attempt_id integer,
+          label_status text, label_value real, paper_settlement_id integer,
+          calibration_row_id integer, source_run_id integer,
+          created_at text not null, updated_at text not null
+        );
+        create table if not exists calibration_rows (
+          id integer primary key, training_row_id integer not null unique,
+          event_key text, strategy_family text, contract_type text,
+          market_family text, event_time_bucket text, prediction_prob real,
+          label_value real, brier real, log_loss real, label_source text,
+          created_at text not null
+        );
         """
     )
     ensure_columns(
@@ -1402,6 +1770,8 @@ def init_db(path: str) -> sqlite3.Connection:
             "clob_token_ids": "text",
             "market_family": "text",
             "eligibility_class": "text",
+            "event_key": "text",
+            "rule_hash": "text",
         },
     )
     ensure_columns(
@@ -1438,6 +1808,23 @@ def init_db(path: str) -> sqlite3.Connection:
             "orderbook_snapshot_id": "integer",
             "depth_near_ask": "real",
             "depth_sufficient": "integer",
+            "event_key": "text",
+            "candidate_key": "text",
+            "strategy_family": "text",
+            "contract_type": "text",
+            "settlement_state": "text",
+            "early_state": "text",
+            "final_state": "text",
+            "payout_mapping_json": "text",
+            "quote_age_seconds": "real",
+            "stale_book_flag": "integer",
+            "complement_arb_edge": "real",
+            "complement_arb_status": "text",
+            "ladder_violation_type": "text",
+            "correction_trade": "text",
+            "latent_final_high_mean_f": "real",
+            "latent_final_high_sigma_f": "real",
+            "local_day_complete": "integer",
         },
     )
     ensure_columns(
@@ -1448,6 +1835,23 @@ def init_db(path: str) -> sqlite3.Connection:
             "label_value": "real",
             "label_source": "text",
             "labeled_at": "text",
+            "event_key": "text",
+            "candidate_key": "text",
+            "strategy_family": "text",
+            "contract_type": "text",
+            "settlement_state": "text",
+            "early_state": "text",
+            "final_state": "text",
+            "payout_mapping_json": "text",
+            "quote_age_seconds": "real",
+            "stale_book_flag": "integer",
+            "complement_arb_edge": "real",
+            "complement_arb_status": "text",
+            "ladder_violation_type": "text",
+            "correction_trade": "text",
+            "latent_final_high_mean_f": "real",
+            "latent_final_high_sigma_f": "real",
+            "local_day_complete": "integer",
         },
     )
     ensure_columns(
@@ -1477,6 +1881,57 @@ def init_db(path: str) -> sqlite3.Connection:
             "label_attempt_id": "integer",
             "label_source": "text",
             "final_high_f": "real",
+            "event_key": "text",
+            "strategy_family": "text",
+        },
+    )
+    ensure_columns(
+        db,
+        "orderbook_snapshots",
+        {
+            "quote_age_seconds": "real",
+            "stale_book_flag": "integer",
+        },
+    )
+    ensure_columns(
+        db,
+        "paper_orders",
+        {
+            "event_key": "text",
+            "candidate_key": "text",
+            "strategy_family": "text",
+        },
+    )
+    ensure_columns(
+        db,
+        "paper_fills",
+        {
+            "event_key": "text",
+            "candidate_key": "text",
+            "strategy_family": "text",
+        },
+    )
+    ensure_columns(
+        db,
+        "paper_positions",
+        {
+            "event_key": "text",
+            "strategy_family": "text",
+        },
+    )
+    ensure_columns(
+        db,
+        "events",
+        {
+            "source_disagreement_f": "real",
+        },
+    )
+    ensure_columns(
+        db,
+        "lifecycle_attribution",
+        {
+            "paper_settlement_id": "integer",
+            "calibration_row_id": "integer",
         },
     )
     seed_station_registry(db)
@@ -1602,9 +2057,10 @@ def record_orderbook_snapshot(
         """
         insert into orderbook_snapshots(
           run_id, market_id, token_id, outcome, captured_at, best_bid, best_ask,
-          spread, depth_at_ask, depth_near_ask, depth_sufficient, raw_status, raw_json
+          spread, depth_at_ask, depth_near_ask, depth_sufficient, raw_status, raw_json,
+          quote_age_seconds, stale_book_flag
         )
-        values(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             run_id,
@@ -1620,9 +2076,316 @@ def record_orderbook_snapshot(
             1 if quote.get("depth_sufficient") else 0,
             quote.get("raw_status"),
             bounded_json(book or {}, RAW_JSON_LIMIT),
+            quote.get("quote_age_seconds"),
+            1 if quote.get("stale_book_flag") else 0,
         ),
     )
     return int(cur.lastrowid)
+
+
+def event_exposure_summary(db: sqlite3.Connection, event_key: str | None) -> dict[str, Any]:
+    if not event_key:
+        return {"open_exposure": 0.0, "open_value": 0.0, "open_position_count": 0}
+    row = db.execute(
+        """
+        select
+          coalesce(sum(cost_basis), 0),
+          coalesce(sum(shares * coalesce(latest_mark, 0)), 0),
+          count(*)
+        from paper_positions
+        where status='open' and event_key=?
+        """,
+        (event_key,),
+    ).fetchone()
+    return {
+        "open_exposure": float(row[0] or 0.0),
+        "open_value": float(row[1] or 0.0),
+        "open_position_count": int(row[2] or 0),
+    }
+
+
+def upsert_event(
+    db: sqlite3.Connection,
+    *,
+    event_key: str,
+    city: str | None,
+    target_date: str | None,
+    source: str | None,
+    station_id: str | None,
+    rule_hash: str | None,
+    seen_at: str,
+    latent_mean: float | None,
+    latent_sigma: float | None,
+    observed_high: float | None,
+    local_day_complete: bool,
+    contract_count: int,
+    source_disagreement_f: float | None = None,
+) -> None:
+    exposure = event_exposure_summary(db, event_key)
+    db.execute(
+        """
+        insert into events(
+          event_key, city, target_date, source, station_id, rule_hash,
+          first_seen, last_seen, latent_final_high_mean_f,
+          latent_final_high_sigma_f, observed_high_f, local_day_complete,
+          contract_count, open_exposure, open_position_count, source_disagreement_f
+        )
+        values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        on conflict(event_key) do update set
+          city=excluded.city,
+          target_date=excluded.target_date,
+          source=excluded.source,
+          station_id=excluded.station_id,
+          rule_hash=excluded.rule_hash,
+          last_seen=excluded.last_seen,
+          latent_final_high_mean_f=excluded.latent_final_high_mean_f,
+          latent_final_high_sigma_f=excluded.latent_final_high_sigma_f,
+          observed_high_f=excluded.observed_high_f,
+          local_day_complete=excluded.local_day_complete,
+          contract_count=excluded.contract_count,
+          open_exposure=excluded.open_exposure,
+          open_position_count=excluded.open_position_count,
+          source_disagreement_f=excluded.source_disagreement_f
+        """,
+        (
+            event_key,
+            city,
+            target_date,
+            source,
+            station_id,
+            rule_hash,
+            seen_at,
+            seen_at,
+            latent_mean,
+            latent_sigma,
+            observed_high,
+            1 if local_day_complete else 0,
+            contract_count,
+            exposure["open_exposure"],
+            exposure["open_position_count"],
+            source_disagreement_f,
+        ),
+    )
+    db.execute(
+        """
+        insert into event_exposure_snapshots(
+          event_key, captured_at, open_exposure, open_value, open_position_count,
+          latent_final_high_mean_f, latent_final_high_sigma_f, observed_high_f,
+          local_day_complete, source_disagreement_f
+        )
+        values(?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            event_key,
+            seen_at,
+            exposure["open_exposure"],
+            exposure["open_value"],
+            exposure["open_position_count"],
+            latent_mean,
+            latent_sigma,
+            observed_high,
+            1 if local_day_complete else 0,
+            source_disagreement_f,
+        ),
+    )
+
+
+def record_contract_payout(
+    db: sqlite3.Connection,
+    *,
+    event_key: str,
+    market_id: str | None,
+    outcome: str | None,
+    token_id: str | None,
+    bucket: BucketSpec | None,
+    spec: settlement_states.ContractSpec,
+    payout_mapping: dict[str, Any],
+    created_at: str,
+) -> None:
+    db.execute(
+        """
+        insert into contract_payouts(
+          event_key, market_id, outcome, token_id, contract_type, side,
+          bucket_lo_f, bucket_hi_f, threshold_f, payout_mapping_json, created_at
+        )
+        values(?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            event_key,
+            market_id,
+            outcome,
+            token_id,
+            spec.contract_type,
+            spec.side,
+            finite_or_none(bucket.lo if bucket else None),
+            finite_or_none(bucket.hi if bucket else None),
+            spec.threshold_f,
+            bounded_json(payout_mapping, RAW_JSON_LIMIT),
+            created_at,
+        ),
+    )
+
+
+def upsert_lifecycle_candidate(
+    db: sqlite3.Connection,
+    *,
+    candidate_key: str,
+    event_key: str | None,
+    strategy_family: str,
+    market_id: str | None,
+    outcome: str | None,
+    signal_id: int | None,
+    training_row_id: int | None,
+    source_run_id: int | None,
+    now: str,
+) -> None:
+    row = db.execute("select id from lifecycle_attribution where candidate_key=?", (candidate_key,)).fetchone()
+    if row:
+        db.execute(
+            """
+            update lifecycle_attribution
+            set event_key=?, strategy_family=?, market_id=?, outcome=?,
+                signal_id=coalesce(?, signal_id), training_row_id=coalesce(?, training_row_id),
+                source_run_id=coalesce(?, source_run_id), updated_at=?
+            where candidate_key=?
+            """,
+            (event_key, strategy_family, market_id, outcome, signal_id, training_row_id, source_run_id, now, candidate_key),
+        )
+        return
+    db.execute(
+        """
+        insert into lifecycle_attribution(
+          candidate_key, event_key, strategy_family, market_id, outcome,
+          signal_id, training_row_id, source_run_id, created_at, updated_at
+        )
+        values(?,?,?,?,?,?,?,?,?,?)
+        """,
+        (candidate_key, event_key, strategy_family, market_id, outcome, signal_id, training_row_id, source_run_id, now, now),
+    )
+
+
+def update_lifecycle_links(db: sqlite3.Connection, candidate_key: str | None = None, signal_id: int | None = None, **links: Any) -> None:
+    allowed = {
+        "order_id",
+        "fill_id",
+        "position_id",
+        "label_attempt_id",
+        "label_status",
+        "label_value",
+        "paper_settlement_id",
+        "calibration_row_id",
+        "strategy_family",
+        "event_key",
+    }
+    updates = {key: value for key, value in links.items() if key in allowed and value is not None}
+    if not updates:
+        return
+    updates["updated_at"] = utc_now_iso()
+    set_clause = ", ".join(f"{key}=?" for key in updates)
+    params = list(updates.values())
+    if candidate_key:
+        db.execute(f"update lifecycle_attribution set {set_clause} where candidate_key=?", (*params, candidate_key))
+    elif signal_id is not None:
+        db.execute(f"update lifecycle_attribution set {set_clause} where signal_id=?", (*params, signal_id))
+
+
+def event_time_bucket_from_features(features_json: str | None) -> str:
+    try:
+        payload = json.loads(features_json or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    minutes = payload.get("minutes_until_local_end_of_day")
+    try:
+        value = float(minutes)
+    except (TypeError, ValueError):
+        return "unknown"
+    if value <= 60:
+        return "0-1h_to_close"
+    if value <= 360:
+        return "1-6h_to_close"
+    if value <= 720:
+        return "6-12h_to_close"
+    return "12h+_to_close"
+
+
+def record_calibration_rows_for_training_ids(
+    db: sqlite3.Connection,
+    row_ids: list[int],
+    *,
+    label_source: str | None,
+    now: str,
+    label_attempt_id: int | None = None,
+) -> int:
+    if not row_ids:
+        return 0
+    placeholders = ",".join("?" for _ in row_ids)
+    rows = db.execute(
+        f"""
+        select id, event_key, strategy_family, contract_type, market_family,
+               model_prob, label_value, features_json, candidate_key
+        from training_rows
+        where id in ({placeholders})
+          and model_prob is not null
+          and label_value in (0, 1)
+        """,
+        row_ids,
+    ).fetchall()
+    count = 0
+    for row in rows:
+        prob = max(1e-6, min(1.0 - 1e-6, float(row[5])))
+        label_value = float(row[6])
+        brier = (prob - label_value) * (prob - label_value)
+        log_loss = -(label_value * math.log(prob) + (1.0 - label_value) * math.log(1.0 - prob))
+        cur = db.execute(
+            """
+            insert into calibration_rows(
+              training_row_id, event_key, strategy_family, contract_type,
+              market_family, event_time_bucket, prediction_prob, label_value,
+              brier, log_loss, label_source, created_at
+            )
+            values(?,?,?,?,?,?,?,?,?,?,?,?)
+            on conflict(training_row_id) do update set
+              event_key=excluded.event_key,
+              strategy_family=excluded.strategy_family,
+              contract_type=excluded.contract_type,
+              market_family=excluded.market_family,
+              event_time_bucket=excluded.event_time_bucket,
+              prediction_prob=excluded.prediction_prob,
+              label_value=excluded.label_value,
+              brier=excluded.brier,
+              log_loss=excluded.log_loss,
+              label_source=excluded.label_source,
+              created_at=excluded.created_at
+            """,
+            (
+                row[0],
+                row[1],
+                row[2] or "unknown",
+                row[3] or "unknown",
+                row[4],
+                event_time_bucket_from_features(row[7]),
+                prob,
+                label_value,
+                brier,
+                log_loss,
+                label_source,
+                now,
+            ),
+        )
+        calibration_id = int(cur.lastrowid or 0)
+        existing = db.execute("select id from calibration_rows where training_row_id=?", (row[0],)).fetchone()
+        if existing:
+            calibration_id = int(existing[0])
+        update_lifecycle_links(
+            db,
+            candidate_key=row[8],
+            calibration_row_id=calibration_id,
+            label_attempt_id=label_attempt_id,
+            label_status=FINAL_LABEL_STATUS,
+            label_value=label_value,
+        )
+        count += 1
+    return count
 
 
 def record_training_row(
@@ -1654,7 +2417,26 @@ def record_training_row(
     ease: float,
     uncertainty: float,
     req_edge: float,
+    event_key: str | None = None,
+    candidate_key: str | None = None,
+    strategy_family: str = "unknown",
+    contract_type: str | None = None,
+    settlement_state: str | None = None,
+    early_state: str | None = None,
+    final_state: str | None = None,
+    payout_mapping: dict[str, Any] | None = None,
+    complement_arb_edge: float | None = None,
+    complement_arb_status: str | None = None,
+    ladder_violation_type: str | None = None,
+    correction_trade: str | None = None,
+    latent_final_high_mean_f: float | None = None,
+    latent_final_high_sigma_f: float | None = None,
+    local_day_complete: bool | None = None,
 ) -> int:
+    event_key = event_key or m.get("event_key")
+    candidate_key = candidate_key or candidate_key_for(event_key, m.get("market_id"), outcome, token_id, created_at)
+    strategy_family = strategy_family if strategy_family in STRATEGY_FAMILIES else "unknown"
+    payout_mapping = payout_mapping or {}
     feature_payload = features.build_decision_features(
         decision_time=created_at,
         market={
@@ -1677,6 +2459,11 @@ def record_training_row(
             "target_date": target_date,
             "eligibility_class": eligibility,
             "edge": edge,
+            "event_key": event_key,
+            "strategy_family": strategy_family,
+            "contract_type": contract_type,
+            "settlement_state": settlement_state,
+            "payout_mapping_json": bounded_json(payout_mapping, RAW_JSON_LIMIT),
         },
         forecast={
             "provider": "open_meteo",
@@ -1703,6 +2490,8 @@ def record_training_row(
             "depth": quote.get("depth"),
             "depth_near_ask": quote.get("depth_near_ask"),
             "depth_sufficient": quote.get("depth_sufficient"),
+            "quote_age_seconds": quote.get("quote_age_seconds"),
+            "stale_book_flag": quote.get("stale_book_flag"),
             "raw_status": quote.get("raw_status"),
         },
         source_records=[
@@ -1725,7 +2514,15 @@ def record_training_row(
                 "resolution_text_hash": features.stable_hash(m.get("resolution_text")),
                 "source_text_hash": features.stable_hash(m.get("source_text")),
             },
+            "event_model": {
+                "event_key": event_key,
+                "latent_final_high_mean_f": latent_final_high_mean_f,
+                "latent_final_high_sigma_f": latent_final_high_sigma_f,
+                "contract_payout_mapping": payout_mapping,
+                "local_day_complete": bool(local_day_complete),
+            },
             "gates": {"required_edge": req_edge, "uncertainty_margin": uncertainty, "eligibility": eligibility, "reason": reason},
+            "strategy": {"family": strategy_family, "candidate_key": candidate_key},
         }
     )
     cur = db.execute(
@@ -1737,9 +2534,14 @@ def record_training_row(
           eligibility_class, source_confidence, bucket_lo_f, bucket_hi_f, bucket_kind,
           bucket_state, market_prob, model_prob, entry_price, bid, ask, spread, depth,
           depth_sufficient, edge, required_edge, uncertainty_margin, ease_score,
-          signal_type, reason, features_json
+          signal_type, strategy_family, event_key, candidate_key, contract_type,
+          settlement_state, early_state, final_state, payout_mapping_json,
+          quote_age_seconds, stale_book_flag, complement_arb_edge,
+          complement_arb_status, ladder_violation_type, correction_trade,
+          latent_final_high_mean_f, latent_final_high_sigma_f, local_day_complete,
+          reason, features_json
         )
-        values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             run_id,
@@ -1778,11 +2580,41 @@ def record_training_row(
             uncertainty,
             ease,
             signal_type,
+            strategy_family,
+            event_key,
+            candidate_key,
+            contract_type,
+            settlement_state,
+            early_state,
+            final_state,
+            bounded_json(payout_mapping, RAW_JSON_LIMIT),
+            quote.get("quote_age_seconds"),
+            1 if quote.get("stale_book_flag") else 0,
+            complement_arb_edge,
+            complement_arb_status,
+            ladder_violation_type,
+            correction_trade,
+            latent_final_high_mean_f,
+            latent_final_high_sigma_f,
+            1 if local_day_complete else 0,
             reason,
             bounded_json(feature_payload, RAW_JSON_LIMIT),
         ),
     )
-    return int(cur.lastrowid)
+    training_row_id = int(cur.lastrowid)
+    upsert_lifecycle_candidate(
+        db,
+        candidate_key=candidate_key,
+        event_key=event_key,
+        strategy_family=strategy_family,
+        market_id=m.get("market_id"),
+        outcome=outcome,
+        signal_id=signal_id,
+        training_row_id=training_row_id,
+        source_run_id=run_id,
+        now=created_at,
+    )
+    return training_row_id
 
 
 def account_row(db: sqlite3.Connection) -> sqlite3.Row | tuple[Any, ...]:
@@ -1826,11 +2658,15 @@ def simulate_paper_order(
     target_date: str | None,
     signal_type: str,
     quote: dict[str, Any],
-) -> None:
+    event_key: str | None = None,
+    candidate_key: str | None = None,
+    strategy_family: str = "unknown",
+) -> dict[str, int | None]:
+    result: dict[str, int | None] = {"order_id": None, "fill_id": None, "position_id": None}
     if getattr(args, "disable_ledger", False):
-        return
+        return result
     if not signal_type.startswith("paper_buy"):
-        return
+        return result
     account = account_row(db)
     account_id, starting_cash, cash, _realized = int(account[0]), float(account[1]), float(account[2]), float(account[3])
     entry = quote.get("entry_price")
@@ -1863,9 +2699,10 @@ def simulate_paper_order(
         """
         insert into paper_orders(
           run_id, signal_id, account_id, market_id, token_id, outcome, side,
-          signal_type, status, requested_shares, limit_price, estimated_cost, reason, created_at
+          signal_type, status, requested_shares, limit_price, estimated_cost,
+          reason, created_at, event_key, candidate_key, strategy_family
         )
-        values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             run_id,
@@ -1882,20 +2719,25 @@ def simulate_paper_order(
             estimated_cost,
             reason,
             created_at,
+            event_key,
+            candidate_key,
+            strategy_family,
         ),
     )
     order_id = int(cur.lastrowid)
+    result["order_id"] = order_id
+    update_lifecycle_links(db, candidate_key=candidate_key, signal_id=signal_id, order_id=order_id)
     if status != "filled":
-        return
+        return result
     price = float(entry)
     cost = shares * price
     if cost > cash + 1e-9:
         db.execute("update paper_orders set status='skipped', reason='cash_guard_triggered' where id=?", (order_id,))
-        return
+        return result
     db.execute(
         """
-        insert into paper_fills(order_id, filled_at, shares, price, cost, slippage, source, raw_status)
-        values(?,?,?,?,?,?,?,?)
+        insert into paper_fills(order_id, filled_at, shares, price, cost, slippage, source, raw_status, event_key, candidate_key, strategy_family)
+        values(?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             order_id,
@@ -1906,8 +2748,12 @@ def simulate_paper_order(
             price - float(quote.get("ask") or price),
             quote.get("execution_source"),
             quote.get("raw_status"),
+            event_key,
+            candidate_key,
+            strategy_family,
         ),
     )
+    result["fill_id"] = int(db.execute("select last_insert_rowid()").fetchone()[0])
     db.execute("update paper_accounts set cash=cash-?, updated_at=? where id=?", (cost, created_at, account_id))
     existing = db.execute(
         "select id, shares, cost_basis from paper_positions where account_id=? and market_id=? and outcome=?",
@@ -1920,19 +2766,23 @@ def simulate_paper_order(
         db.execute(
             """
             update paper_positions
-            set shares=?, avg_price=?, cost_basis=?, latest_mark=?, status='open', updated_at=?
+            set shares=?, avg_price=?, cost_basis=?, latest_mark=?, status='open',
+                event_key=coalesce(?, event_key), strategy_family=coalesce(?, strategy_family),
+                updated_at=?
             where id=?
             """,
-            (new_shares, new_cost / new_shares, new_cost, price, created_at, pos_id),
+            (new_shares, new_cost / new_shares, new_cost, price, event_key, strategy_family, created_at, pos_id),
         )
+        result["position_id"] = pos_id
     else:
-        db.execute(
+        cur = db.execute(
             """
             insert into paper_positions(
               account_id, market_id, token_id, title, outcome, city, target_date,
               shares, avg_price, cost_basis, realized_pnl, latest_mark, status, updated_at
+              , event_key, strategy_family
             )
-            values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 account_id,
@@ -1949,8 +2799,22 @@ def simulate_paper_order(
                 price,
                 "open",
                 created_at,
+                event_key,
+                strategy_family,
             ),
         )
+        result["position_id"] = int(cur.lastrowid)
+    update_lifecycle_links(
+        db,
+        candidate_key=candidate_key,
+        signal_id=signal_id,
+        order_id=result["order_id"],
+        fill_id=result["fill_id"],
+        position_id=result["position_id"],
+        strategy_family=strategy_family,
+        event_key=event_key,
+    )
+    return result
 
 
 def latest_signal_marks(db: sqlite3.Connection) -> dict[tuple[str, str], tuple[int, float]]:
@@ -1975,13 +2839,13 @@ def settle_paper_positions_from_latest_prices(db: sqlite3.Connection, now: str) 
     marks = latest_signal_marks(db)
     positions = db.execute(
         """
-        select id, market_id, outcome, shares, cost_basis
+        select id, market_id, outcome, shares, cost_basis, event_key, strategy_family
         from paper_positions
         where account_id=? and status='open'
         """,
         (account_id,),
     ).fetchall()
-    for pos_id, market_id, outcome, shares, cost_basis in positions:
+    for pos_id, market_id, outcome, shares, cost_basis, event_key, strategy_family in positions:
         latest = marks.get((str(market_id), str(outcome)))
         if not latest:
             continue
@@ -1997,10 +2861,10 @@ def settle_paper_positions_from_latest_prices(db: sqlite3.Connection, now: str) 
             continue
         db.execute(
             """
-            insert into paper_settlements(position_id, settled_at, outcome_status, payout, realized_pnl, source_signal_id)
-            values(?,?,?,?,?,?)
+            insert into paper_settlements(position_id, settled_at, outcome_status, payout, realized_pnl, source_signal_id, event_key, strategy_family)
+            values(?,?,?,?,?,?,?,?)
             """,
-            (pos_id, now, status, payout, realized, source_signal_id),
+            (pos_id, now, status, payout, realized, source_signal_id, event_key, strategy_family),
         )
         db.execute(
             "update paper_positions set status='settled', realized_pnl=?, updated_at=? where id=?",
@@ -2111,6 +2975,11 @@ def scan(args: argparse.Namespace) -> None:
                 market_bucket = parse_bucket(str(candidate_outcome))
                 if market_bucket is not None:
                     break
+        rule_material = event_rule_text(m, market_bucket)
+        rule_hash = features.stable_hash(rule_material) or "no-rule"
+        event_key = event_key_for(city, target_date, m.get("source_host"), station_id, rule_material)
+        m["event_key"] = event_key
+        m["rule_hash"] = rule_hash
         market_level_eligibility = market_eligibility(family, source_conf_base, station_id, target_date, market_bucket, timezone_name)
         db.execute(
             "insert into markets(market_id,title,url,first_seen,last_seen) values(?,?,?,?,?) "
@@ -2122,7 +2991,8 @@ def scan(args: argparse.Namespace) -> None:
             update markets
             set rules_text=?, resolution_text=?, source_text=?, source_links=?,
                 source_host=?, source_url=?, station_id=?, source_confidence=?,
-                clob_token_ids=?, market_family=?, eligibility_class=?
+                clob_token_ids=?, market_family=?, eligibility_class=?,
+                event_key=?, rule_hash=?
             where market_id=?
             """,
             (
@@ -2137,6 +3007,8 @@ def scan(args: argparse.Namespace) -> None:
                 json.dumps(m.get("token_ids") or [], ensure_ascii=True),
                 family,
                 market_level_eligibility,
+                event_key,
+                rule_hash,
                 m["market_id"],
             ),
         )
@@ -2183,14 +3055,21 @@ def scan(args: argparse.Namespace) -> None:
             )
         observation_id = record_station_observation(db, run_id, m["market_id"], obs)
         observed_high = obs.high_so_far_f
+        target = parse_iso_date(target_date)
+        local = parse_iso_date(obs.local_date)
+        local_day_complete = bool(target and local and local > target)
         m["forecast_high_f"] = high
         m["observed_high_f"] = observed_high
         pending_rows: list[dict[str, Any]] = []
         ladder_rows: list[dict[str, Any]] = []
         for outcome, market_prob, token_id in zip(m["outcomes"], m["prices"], m.get("token_ids") or []):
             bucket = parse_bucket(str(outcome)) or title_bucket
+            contract_spec = contract_spec_for_bucket(bucket, str(outcome))
+            side_state = settlement_state_for_bucket(bucket, observed_high, str(outcome), target_date, obs.local_date)
+            yes_state = settlement_state_for_bucket(bucket, observed_high, "Yes", target_date, obs.local_date)
+            payout_mapping = payout_mapping_for_contract(contract_spec)
             baseline_high = observed_high if high is None else high
-            bucket_state = bucket_state_from_observation(observed_high, bucket, target_date, obs.local_date)
+            bucket_state = settlement_states.legacy_bucket_state(yes_state)
             threshold_status = threshold_status_from_bucket_state(bucket_state)
             model_prob = None
             if bucket is not None and baseline_high is not None:
@@ -2264,6 +3143,23 @@ def scan(args: argparse.Namespace) -> None:
                     "orderbook_snapshot_id": quote.get("orderbook_snapshot_id"),
                     "depth_near_ask": quote.get("depth_near_ask"),
                     "depth_sufficient": 1 if quote.get("depth_sufficient") else 0,
+                    "event_key": event_key,
+                    "candidate_key": candidate_key_for(event_key, m["market_id"], str(outcome), token_id, now),
+                    "strategy_family": "unknown",
+                    "contract_type": contract_spec.contract_type,
+                    "settlement_state": side_state.state,
+                    "early_state": side_state.early_state,
+                    "final_state": side_state.final_state,
+                    "payout_mapping_json": bounded_json(payout_mapping, RAW_JSON_LIMIT),
+                    "quote_age_seconds": quote.get("quote_age_seconds"),
+                    "stale_book_flag": 1 if quote.get("stale_book_flag") else 0,
+                    "complement_arb_edge": None,
+                    "complement_arb_status": None,
+                    "ladder_violation_type": None,
+                    "correction_trade": None,
+                    "latent_final_high_mean_f": high,
+                    "latent_final_high_sigma_f": args.sigma,
+                    "local_day_complete": 1 if local_day_complete else 0,
             }
             pending_rows.append(
                 {
@@ -2284,6 +3180,9 @@ def scan(args: argparse.Namespace) -> None:
                     "ease": ease,
                     "uncertainty": uncertainty,
                     "req_edge": req_edge,
+                    "contract_spec": contract_spec,
+                    "settlement_state": side_state,
+                    "payout_mapping": payout_mapping,
                 }
             )
             ladder_rows.append(
@@ -2294,12 +3193,62 @@ def scan(args: argparse.Namespace) -> None:
                     "entry_price": entry_price,
                     "bid": quote.get("bid"),
                     "ask": quote.get("ask"),
+                    "depth": quote.get("depth"),
+                    "quote_age_seconds": quote.get("quote_age_seconds"),
                     "bucket_state": bucket_state,
+                    "bucket_lo_f": bucket.lo if bucket else None,
+                    "bucket_hi_f": bucket.hi if bucket else None,
                 }
             )
+        max_quote_age = float(os.environ.get("STALE_BOOK_MAX_AGE_SECONDS", "60"))
+        ladder_struct = ladder_monitor(ladder_rows, min_depth=float(getattr(args, "min_fill_shares", 1.0)), max_quote_age_seconds=max_quote_age)
         ladder_note = ladder_diagnostics(ladder_rows)
+        ladder_violations = [v for v in ladder_struct.get("violations", []) if v != "ladder_ok"]
+        ladder_violation_type = ",".join(ladder_violations) if ladder_violations else None
+        correction_trade = ladder_struct.get("candidate_correction_trade")
+        complement = detect_complement_arbitrage(
+            ladder_rows,
+            margin=float(os.environ.get("COMPLEMENT_ARB_MARGIN", "0.01")),
+            min_depth=float(getattr(args, "min_fill_shares", 1.0)),
+            max_quote_age_seconds=max_quote_age,
+        )
         for row in pending_rows:
             row["signal_payload"]["ladder_diagnostic"] = ladder_note
+            row["signal_payload"]["ladder_violation_type"] = ladder_violation_type
+            row["signal_payload"]["correction_trade"] = bounded_json(correction_trade, RAW_JSON_LIMIT) if correction_trade else None
+            row["signal_payload"]["complement_arb_status"] = complement.get("status")
+            row["signal_payload"]["complement_arb_edge"] = complement.get("edge_after_margin")
+            normalized_outcome = str(row["outcome"]).strip().lower()
+            if complement.get("is_arb") and normalized_outcome in {"yes", "y", "no", "n"}:
+                row["signal_payload"]["signal_type"] = "paper_buy_complement_arb"
+                row["signal_payload"]["reason"] = (
+                    f"complement YES+NO asks {float(complement['ask_sum']):.3f} below payout after margin; "
+                    "separate from forecast edge"
+                )
+            elif correction_trade and correction_trade.get("outcome") == row["outcome"] and row["signal_payload"].get("signal_type") != "skip":
+                row["signal_payload"]["signal_type"] = "paper_buy_ladder_inconsistency"
+                row["signal_payload"]["reason"] = f"ladder correction candidate: {correction_trade.get('action')}"
+            row["signal_payload"]["strategy_family"] = classify_strategy_family(
+                row["signal_payload"].get("signal_type"),
+                bucket_state=row["bucket_state"],
+                settlement_state=row["signal_payload"].get("settlement_state"),
+                ladder_status=ladder_struct.get("status"),
+                complement_status=complement.get("status"),
+                source_confidence=row["source_conf"],
+                eligibility_class=row["eligibility"],
+                observed_high_f=observed_high,
+            )
+            record_contract_payout(
+                db,
+                event_key=event_key,
+                market_id=m["market_id"],
+                outcome=row["outcome"],
+                token_id=row["token_id"],
+                bucket=row["bucket"],
+                spec=row["contract_spec"],
+                payout_mapping=row["payout_mapping"],
+                created_at=now,
+            )
             columns = list(row["signal_payload"].keys())
             cur = db.execute(
                 f"insert into signals({','.join(columns)}) values ({','.join(['?'] * len(columns))})",
@@ -2335,6 +3284,21 @@ def scan(args: argparse.Namespace) -> None:
                 row["ease"],
                 row["uncertainty"],
                 row["req_edge"],
+                event_key=row["signal_payload"].get("event_key"),
+                candidate_key=row["signal_payload"].get("candidate_key"),
+                strategy_family=row["signal_payload"].get("strategy_family") or "unknown",
+                contract_type=row["signal_payload"].get("contract_type"),
+                settlement_state=row["signal_payload"].get("settlement_state"),
+                early_state=row["signal_payload"].get("early_state"),
+                final_state=row["signal_payload"].get("final_state"),
+                payout_mapping=row["payout_mapping"],
+                complement_arb_edge=row["signal_payload"].get("complement_arb_edge"),
+                complement_arb_status=row["signal_payload"].get("complement_arb_status"),
+                ladder_violation_type=row["signal_payload"].get("ladder_violation_type"),
+                correction_trade=row["signal_payload"].get("correction_trade"),
+                latent_final_high_mean_f=high,
+                latent_final_high_sigma_f=args.sigma,
+                local_day_complete=local_day_complete,
             )
             simulate_paper_order(
                 db,
@@ -2349,8 +3313,26 @@ def scan(args: argparse.Namespace) -> None:
                 row["signal_payload"]["target_date"],
                 row["signal_payload"]["signal_type"],
                 row["quote"],
+                event_key=row["signal_payload"].get("event_key"),
+                candidate_key=row["signal_payload"].get("candidate_key"),
+                strategy_family=row["signal_payload"].get("strategy_family") or "unknown",
             )
             signal_count += 1
+        upsert_event(
+            db,
+            event_key=event_key,
+            city=city,
+            target_date=target_date,
+            source=m.get("source_host"),
+            station_id=station_id,
+            rule_hash=rule_hash,
+            seen_at=now,
+            latent_mean=high,
+            latent_sigma=args.sigma,
+            observed_high=observed_high,
+            local_day_complete=local_day_complete,
+            contract_count=len(pending_rows),
+        )
     db.execute("update runs set markets_seen=?, signals_seen=? where id=?", (len(markets), signal_count, run_id))
     settle_paper_positions_from_latest_prices(db, now)
     settle_paper_positions_from_labels(db, now)
@@ -2670,6 +3652,25 @@ def apply_final_label_to_training_rows(
             *row_ids,
         ),
     )
+    rows = db.execute(
+        f"select candidate_key from training_rows where id in ({placeholders})",
+        row_ids,
+    ).fetchall()
+    for row in rows:
+        update_lifecycle_links(
+            db,
+            candidate_key=row[0],
+            label_attempt_id=attempt_id,
+            label_status=FINAL_LABEL_STATUS,
+            label_value=float(label_value),
+        )
+    record_calibration_rows_for_training_ids(
+        db,
+        row_ids,
+        label_source=label_source,
+        now=str(attempt.get("attempted_at") or utc_now_iso()),
+        label_attempt_id=attempt_id,
+    )
     return len(row_ids)
 
 
@@ -2928,18 +3929,25 @@ def settle_paper_positions_from_labels(db: sqlite3.Connection, now: str) -> int:
     account_id = int(account[0])
     positions = db.execute(
         """
-        select id, market_id, outcome, shares, cost_basis
+        select id, market_id, outcome, shares, cost_basis, event_key, strategy_family
         from paper_positions
         where account_id=? and status='open'
         """,
         (account_id,),
     ).fetchall()
     settled = 0
-    for pos_id, market_id, outcome, shares, cost_basis in positions:
+    for pos_id, market_id, outcome, shares, cost_basis, position_event_key, position_strategy_family in positions:
         label = final_label_for_position(db, str(market_id), str(outcome))
         if not label:
             continue
         source_training_row_id, label_value, label_source, _labeled_at, label_attempt_id, final_high_f = label
+        meta = db.execute(
+            "select event_key, strategy_family, candidate_key from training_rows where id=?",
+            (source_training_row_id,),
+        ).fetchone()
+        event_key = (meta[0] if meta else None) or position_event_key
+        strategy_family = (meta[1] if meta else None) or position_strategy_family
+        candidate_key = meta[2] if meta else None
         existing = db.execute("select id from paper_settlements where position_id=?", (pos_id,)).fetchone()
         if existing:
             continue
@@ -2951,9 +3959,9 @@ def settle_paper_positions_from_labels(db: sqlite3.Connection, now: str) -> int:
             insert into paper_settlements(
               position_id, settled_at, outcome_status, payout, realized_pnl,
               source_signal_id, source_training_row_id, label_attempt_id,
-              label_source, final_high_f
+              label_source, final_high_f, event_key, strategy_family
             )
-            values(?,?,?,?,?,?,?,?,?,?)
+            values(?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 pos_id,
@@ -2966,8 +3974,11 @@ def settle_paper_positions_from_labels(db: sqlite3.Connection, now: str) -> int:
                 label_attempt_id,
                 label_source,
                 final_high_f,
+                event_key,
+                strategy_family,
             ),
         )
+        settlement_id = int(db.execute("select last_insert_rowid()").fetchone()[0])
         db.execute(
             "update paper_positions set status='settled', realized_pnl=?, updated_at=? where id=?",
             (realized, now, pos_id),
@@ -2976,12 +3987,35 @@ def settle_paper_positions_from_labels(db: sqlite3.Connection, now: str) -> int:
             "update paper_accounts set cash=cash+?, realized_pnl=realized_pnl+?, updated_at=? where id=?",
             (payout, realized, now, account_id),
         )
+        update_lifecycle_links(
+            db,
+            candidate_key=candidate_key,
+            paper_settlement_id=settlement_id,
+            position_id=pos_id,
+            label_attempt_id=label_attempt_id,
+            label_status=FINAL_LABEL_STATUS,
+            label_value=label_value,
+            event_key=event_key,
+            strategy_family=strategy_family,
+        )
         settled += 1
     return settled
 
 
 def label(args: argparse.Namespace) -> None:
     ensure_paper_only_guard(args)
+    if bool(getattr(args, "dry_run", False)) and int(getattr(args, "limit", 0) or 0) <= 0:
+        now = utc_now_iso()
+        today = dt.datetime.fromisoformat(now).date()
+        cutoff = today - dt.timedelta(days=max(0, int(getattr(args, "min_age_days", 2))))
+        print("labeler=paper_only")
+        print("mode=paper_only live_trading=false wallet=false order_placement=false")
+        print(
+            f"dry_run=true cutoff_date={cutoff.isoformat()} candidates=0 attempts_written=0 "
+            "final_label_groups=0 final_training_rows=0 provisional_attempts=0 "
+            "pending_attempts=0 skipped_attempts=0 error_attempts=0 settled_positions=0"
+        )
+        return
     db = init_db(args.db)
     now = utc_now_iso()
     today = dt.datetime.fromisoformat(now).date()

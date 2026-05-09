@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import re
 import sqlite3
@@ -242,6 +243,8 @@ def count_rows(db: sqlite3.Connection, table: str, where: str = "1=1") -> int:
         "paper_positions",
         "paper_settlements",
         "label_attempts",
+        "calibration_rows",
+        "events",
     }
     if table not in allowed:
         raise ValueError(f"unexpected table name: {table}")
@@ -445,9 +448,11 @@ def available_performance_metrics(db: sqlite3.Connection | None) -> dict[str, An
             "open_positions": 0,
             "settled_positions": 0,
             "paper_settlements": 0,
+            "calibration_rows": 0,
             "avg_edge": None,
             "paper_buy_avg_edge": None,
             "brier_score": None,
+            "log_loss": None,
             "unresolved_rate": None,
         }
 
@@ -469,7 +474,8 @@ def available_performance_metrics(db: sqlite3.Connection | None) -> dict[str, An
     open_positions = count_rows(db, "paper_positions", "status='open'")
     settled_positions = count_rows(db, "paper_positions", "status='settled'")
     paper_settlements = count_rows(db, "paper_settlements")
-    avg_edge = paper_buy_avg_edge = brier_score = None
+    calibration_rows = count_rows(db, "calibration_rows")
+    avg_edge = paper_buy_avg_edge = brier_score = log_loss = None
     if table_exists(db, "training_rows"):
         avg_edge = db.execute("select avg(edge) from training_rows where edge is not null").fetchone()[0]
         paper_buy_avg_edge = db.execute(
@@ -484,6 +490,26 @@ def available_performance_metrics(db: sqlite3.Connection | None) -> dict[str, An
               and label_value in (0, 1)
             """
         ).fetchone()[0]
+        label_rows = db.execute(
+            """
+            select model_prob, label_value
+            from training_rows
+            where model_prob is not null
+              and label_value is not null
+              and label_value in (0, 1)
+            """
+        ).fetchall()
+        if label_rows:
+            losses = []
+            for prob_raw, label_raw in label_rows:
+                prob = max(1e-6, min(1.0 - 1e-6, float(prob_raw)))
+                label = float(label_raw)
+                losses.append(-(label * math.log(prob) + (1.0 - label) * math.log(1.0 - prob)))
+            log_loss = sum(losses) / len(losses)
+    if table_exists(db, "calibration_rows") and calibration_rows:
+        row = db.execute("select avg(brier), avg(log_loss) from calibration_rows").fetchone()
+        brier_score = row[0] if row and row[0] is not None else brier_score
+        log_loss = row[1] if row and row[1] is not None else log_loss
 
     unresolved_rate = None
     if training_rows > 0:
@@ -507,9 +533,11 @@ def available_performance_metrics(db: sqlite3.Connection | None) -> dict[str, An
         "open_positions": open_positions,
         "settled_positions": settled_positions,
         "paper_settlements": paper_settlements,
+        "calibration_rows": calibration_rows,
         "avg_edge": float(avg_edge) if avg_edge is not None else None,
         "paper_buy_avg_edge": float(paper_buy_avg_edge) if paper_buy_avg_edge is not None else None,
         "brier_score": float(brier_score) if brier_score is not None else None,
+        "log_loss": float(log_loss) if log_loss is not None else None,
         "unresolved_rate": unresolved_rate,
     }
 
@@ -547,10 +575,17 @@ def metric_family_readiness(
     training_ready = evidence["training_rows"] >= minimums["training_rows"]
     days_ready = evidence["calendar_days"] >= minimums["calendar_days"]
     return {
+        "calibration_brier_log_loss": {
+            "ready": labeled_ready and training_ready and feature_ok,
+            "evidence": evidence["labeled_rows"],
+            "missing": [name for name, ok in (("labeled_rows", labeled_ready), ("training_rows", training_ready), ("critical_features", feature_ok)) if not ok],
+            "primary_after_labels": True,
+        },
         "realized_return_pct": {
             "ready": snapshot_rows > 0,
             "evidence": snapshot_rows,
             "missing": [] if snapshot_rows > 0 else ["paper_account_snapshots"],
+            "secondary": True,
         },
         "brier_score": {
             "ready": labeled_ready and training_ready and feature_ok,
@@ -753,8 +788,8 @@ def evaluate_tuning_state(
         "proposed_tunables": proposed_tunables,
         "allowed_tunables": allowed_tunables,
         "target_metrics": {
-            "primary": goal.get("primary_metric") or "realized_return_pct",
-            "secondary": goal.get("secondary_metrics") or "brier_score, max_drawdown, unresolved_rate",
+            "primary": goal.get("primary_metric") or "calibration_brier_log_loss",
+            "secondary": goal.get("secondary_metrics") or "realized_return_pct, max_drawdown, unresolved_rate",
             "validation_method": goal.get("validation_method") or "date_walk_forward",
         },
         "proposal_trace": {

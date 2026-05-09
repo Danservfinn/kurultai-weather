@@ -18,6 +18,7 @@ Current feature families:
 - Cross-outcome ladder consistency.
 - Source quality and missingness.
 - Portfolio/risk context.
+- Event key, latent final-high distribution, strategy family, contract type, and payout-map hash.
 - No-lookahead audit fields.
 
 The detailed feature backlog is in [research/data_sources_and_tunable_variables.md](../research/data_sources_and_tunable_variables.md).
@@ -49,5 +50,16 @@ Each row should preserve enough IDs to reconstruct decision context:
 - Feature JSON built at decision time.
 - Label fields filled later.
 - Label-attempt provenance rows linked by market/outcome/target/station.
+- Lifecycle attribution rows linking candidate, signal, simulated fill, label, settlement, calibration row, and strategy family.
 
 This separation is the main guard against accidental lookahead and overfitting.
+
+## Lifecycle and Calibration
+
+Paper-only attribution tables connect the full research path:
+
+- `lifecycle_attribution` links candidate key, event key, strategy family, signal snapshot, simulated order/fill/position, final label attempt, paper settlement, and calibration row.
+- `calibration_rows` stores post-label prediction probability, binary label, Brier score, log loss, event-time bucket, strategy family, and contract type.
+- `events`, `contract_payouts`, and `event_exposure_snapshots` preserve event keys, latent final-high distribution, payout mapping, and paper exposure.
+
+These tables are for research evaluation only. They do not enable wallets, live trading, order placement, signing, or secrets.

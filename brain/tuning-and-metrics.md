@@ -49,14 +49,19 @@ Unsafe log entries are sanitized when loaded for display and cannot turn on trad
 
 ## Metrics
 
-Primary metric: realized return percentage from the paper ledger.
+Primary research metrics after labels:
+
+- Calibration quality by event-time bucket, strategy family, and contract type.
+- Brier score by contract type and strategy family.
+- Log loss by contract type and strategy family.
 
 Secondary metrics:
 
-- Brier score when enough labeled rows have model probabilities and binary labels.
+- Realized return percentage from the simulated paper ledger.
 - Maximum drawdown from paper account snapshots.
 - Unresolved rate from labeled vs. unlabeled training rows.
+- Fill realism, stale quote/reaction lag, label delay, ladder violations, source/station ambiguity, and event exposure.
 
 Only final delayed labels count toward tuning readiness. Pending, skipped, error, and provisional label attempts remain useful diagnostics but do not satisfy the labeled-row gate.
 
-Tuning should stay proposal-only until the paper ledger has enough labeled evidence to evaluate whether an apparent edge survives spread, liquidity, station ambiguity, and stale data.
+Tuning should stay proposal-only until the paper ledger has enough labeled evidence to evaluate whether an apparent edge survives spread, liquidity, station ambiguity, stale data, settlement-state ambiguity, and strategy-family attribution. Return is useful, but it is not the primary promotion metric.

@@ -63,6 +63,85 @@ class WeatherEdgeTests(unittest.TestCase):
         )
         self.assertEqual(sig, "paper_buy_touched_threshold")
 
+    def test_settlement_states_follow_threshold_exact_range_semantics(self):
+        threshold = scanner.parse_bucket("80°F+")
+        state = scanner.settlement_state_for_bucket(threshold, 80.0, "Yes", "2026-05-09", "2026-05-09")
+        self.assertEqual(state.early_state, "yes_certain")
+        no_state = scanner.settlement_state_for_bucket(threshold, 80.0, "No", "2026-05-09", "2026-05-09")
+        self.assertEqual(no_state.early_state, "no_impossible")
+        final_no = scanner.settlement_state_for_bucket(threshold, 79.0, "Yes", "2026-05-09", "2026-05-10")
+        self.assertEqual(final_no.final_state, "final_no")
+
+        exact = scanner.parse_bucket("80°F")
+        touched = scanner.settlement_state_for_bucket(exact, 80.0, "Yes", "2026-05-09", "2026-05-09")
+        self.assertEqual(touched.early_state, "still_possible")
+        exceeded = scanner.settlement_state_for_bucket(exact, 81.0, "Yes", "2026-05-09", "2026-05-09")
+        self.assertEqual(exceeded.early_state, "yes_impossible")
+        final_exact = scanner.settlement_state_for_bucket(exact, 80.0, "Yes", "2026-05-09", "2026-05-10")
+        self.assertEqual(final_exact.final_state, "final_yes")
+
+        bucket = scanner.parse_bucket("80-82°F")
+        range_possible = scanner.settlement_state_for_bucket(bucket, 81.0, "Yes", "2026-05-09", "2026-05-09")
+        self.assertEqual(range_possible.early_state, "still_possible")
+        range_exceeded = scanner.settlement_state_for_bucket(bucket, 83.0, "Yes", "2026-05-09", "2026-05-09")
+        self.assertEqual(range_exceeded.early_state, "yes_impossible")
+
+    def test_event_key_uses_city_date_source_station_and_rule(self):
+        key = scanner.event_key_for("New York", "2026-05-09", "Weather Underground", "KLGA", "high >= 80")
+        same = scanner.event_key_for("new york", "2026-05-09", "weather underground", "klga", "high >= 80")
+        other_station = scanner.event_key_for("New York", "2026-05-09", "Weather Underground", "KJFK", "high >= 80")
+        other_rule = scanner.event_key_for("New York", "2026-05-09", "Weather Underground", "KLGA", "high >= 81")
+        self.assertEqual(key, same)
+        self.assertNotEqual(key, other_station)
+        self.assertNotEqual(key, other_rule)
+
+    def test_complement_arb_detector_requires_depth_and_fresh_quotes(self):
+        rows = [
+            {"outcome": "Yes", "ask": 0.42, "depth": 5.0, "quote_age_seconds": 10},
+            {"outcome": "No", "ask": 0.55, "depth": 5.0, "quote_age_seconds": 10},
+        ]
+        arb = scanner.detect_complement_arbitrage(rows, margin=0.01, min_depth=2.0, max_quote_age_seconds=60)
+        self.assertTrue(arb["is_arb"])
+        self.assertEqual(arb["candidate_trade"], "buy_yes_and_no")
+
+        stale = scanner.detect_complement_arbitrage(
+            [{**rows[0], "quote_age_seconds": 90}, rows[1]],
+            margin=0.01,
+            min_depth=2.0,
+            max_quote_age_seconds=60,
+        )
+        self.assertFalse(stale["is_arb"])
+        self.assertEqual(stale["status"], "stale_quote")
+
+        thin = scanner.detect_complement_arbitrage(
+            [{**rows[0], "depth": 1.0}, rows[1]],
+            margin=0.01,
+            min_depth=2.0,
+            max_quote_age_seconds=60,
+        )
+        self.assertFalse(thin["is_arb"])
+        self.assertEqual(thin["status"], "insufficient_depth")
+
+    def test_strategy_family_classification(self):
+        self.assertEqual(scanner.classify_strategy_family("watch"), "watch")
+        self.assertEqual(scanner.classify_strategy_family("skip"), "skip")
+        self.assertEqual(
+            scanner.classify_strategy_family("paper_buy_complement_arb", complement_status="complement_arb"),
+            "complement_arb",
+        )
+        self.assertEqual(
+            scanner.classify_strategy_family("paper_buy_forecast_distribution", bucket_state="already_won"),
+            "latency_absorbing_state",
+        )
+        self.assertEqual(
+            scanner.classify_strategy_family("paper_buy_forecast_distribution", ladder_status="ladder_violation"),
+            "ladder_inconsistency",
+        )
+        self.assertEqual(
+            scanner.classify_strategy_family("paper_buy_forecast_distribution"),
+            "forecast_distribution_directional",
+        )
+
     def test_ladder_diagnostics_flags_gaps(self):
         rows = [
             {"outcome": "80F", "model_prob": 0.20, "entry_price": 0.20},
@@ -128,6 +207,125 @@ class WeatherEdgeTests(unittest.TestCase):
             self.assertAlmostEqual(metrics["open_exposure"], 2.0)
             self.assertEqual(metrics["unresolved_positions"], 1)
             self.assertEqual(db.execute("select count(*) from paper_fills").fetchone()[0], 1)
+
+    def test_lifecycle_schema_links_candidate_fill_label_settlement_and_calibration(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+            args = argparse.Namespace(
+                disable_ledger=False,
+                paper_size=5.0,
+                max_position_pct=0.02,
+                max_city_date_pct=0.10,
+                max_open_exposure_pct=0.50,
+                min_fill_shares=1.0,
+            )
+            quote = {
+                "execution_source": "clob_book",
+                "entry_price": 0.40,
+                "bid": 0.39,
+                "ask": 0.40,
+                "spread": 0.01,
+                "depth": 10.0,
+                "depth_sufficient": True,
+                "raw_status": "ok",
+                "quote_age_seconds": 3.0,
+                "stale_book_flag": False,
+            }
+            bucket = scanner.parse_bucket("80°F+")
+            event_key = scanner.event_key_for("Denver", "2026-05-09", "example.com", "KDEN", "high >= 80")
+            candidate_key = scanner.candidate_key_for(event_key, "m-life", "Yes", "token-1", "2026-05-09T12:00:00+00:00")
+            row_id = scanner.record_training_row(
+                db,
+                1,
+                7,
+                "2026-05-09T12:00:00+00:00",
+                {
+                    "market_id": "m-life",
+                    "title": "Will Denver high temperature be 80°F or above?",
+                    "source_url": "https://example.com",
+                    "source_host": "example.com",
+                    "station_id": "KDEN",
+                    "forecast_high_f": 83.0,
+                    "observed_high_f": 78.0,
+                    "event_key": event_key,
+                },
+                "Yes",
+                "token-1",
+                "Denver",
+                "2026-05-09",
+                "KDEN",
+                "station_registry",
+                1,
+                1,
+                1,
+                bucket,
+                "still_possible",
+                quote,
+                0.40,
+                0.75,
+                0.35,
+                "paper_buy_forecast_distribution",
+                "passes paper filters",
+                "high",
+                "daily_temperature",
+                "clean_station",
+                9.0,
+                0.03,
+                0.08,
+                event_key=event_key,
+                candidate_key=candidate_key,
+                strategy_family="forecast_distribution_directional",
+                contract_type="threshold",
+                settlement_state="still_possible",
+                early_state="still_possible",
+                final_state="unresolved",
+                payout_mapping={"yes_condition": "final_high_f >= 79.5"},
+                latent_final_high_mean_f=83.0,
+                latent_final_high_sigma_f=3.5,
+                local_day_complete=False,
+            )
+            scanner.simulate_paper_order(
+                db,
+                args,
+                run_id=1,
+                signal_id=7,
+                created_at="2026-05-09T12:00:00+00:00",
+                m={"market_id": "m-life", "title": "Will Denver high temperature be 80°F or above?"},
+                outcome="Yes",
+                token_id="token-1",
+                city="Denver",
+                target_date="2026-05-09",
+                signal_type="paper_buy_forecast_distribution",
+                quote=quote,
+                event_key=event_key,
+                candidate_key=candidate_key,
+                strategy_family="forecast_distribution_directional",
+            )
+            attempt = {
+                "label_value": 1.0,
+                "source_provider": "noaa_ncei",
+                "attempted_at": "2026-05-11T00:00:00+00:00",
+            }
+            updated = scanner.apply_final_label_to_training_rows(
+                db,
+                {"market_id": "m-life", "outcome": "Yes", "target_date": "2026-05-09", "station_id": "KDEN"},
+                attempt,
+                11,
+            )
+            settled = scanner.settle_paper_positions_from_labels(db, "2026-05-11T00:00:00+00:00")
+
+            self.assertEqual(row_id, 1)
+            self.assertEqual(updated, 1)
+            self.assertEqual(settled, 1)
+            lifecycle = db.execute(
+                "select order_id, fill_id, position_id, label_attempt_id, paper_settlement_id, calibration_row_id, strategy_family from lifecycle_attribution where candidate_key=?",
+                (candidate_key,),
+            ).fetchone()
+            self.assertIsNotNone(lifecycle)
+            self.assertTrue(all(lifecycle[i] is not None for i in range(6)))
+            self.assertEqual(lifecycle[6], "forecast_distribution_directional")
+            self.assertEqual(db.execute("select count(*) from calibration_rows").fetchone()[0], 1)
+            self.assertEqual(db.execute("select contract_type from calibration_rows").fetchone()[0], "threshold")
 
     def test_training_row_export_writes_csv(self):
         with tempfile.TemporaryDirectory() as td:

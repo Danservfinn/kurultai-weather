@@ -19,6 +19,7 @@ The dashboard includes:
 - Core row counts.
 - Evidence progress.
 - Labeling and settlement progress.
+- Research metrics: strategy PnL, edge buckets, Brier/log loss by contract type, fill realism, label delay, stale quote/reaction lag, ladder violations, station/source ambiguity, time-to-local-close, lifecycle funnel, and event exposure/latent final-high summary.
 - Equity trail.
 - Tuning readiness and performance trace.
 - Tuning iteration performance.

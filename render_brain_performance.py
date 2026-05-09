@@ -13,6 +13,7 @@ import argparse
 import datetime as dt
 import html
 import json
+import math
 import os
 import sqlite3
 from collections.abc import Sequence
@@ -122,6 +123,12 @@ def table_exists(db: sqlite3.Connection, table: str) -> bool:
     return bool(row)
 
 
+def column_exists(db: sqlite3.Connection, table: str, column: str) -> bool:
+    if not table_exists(db, table):
+        return False
+    return column in {row[1] for row in db.execute(f"pragma table_info({table})")}
+
+
 def table_count(db: sqlite3.Connection, table: str) -> int:
     allowed = {
         "runs",
@@ -137,6 +144,11 @@ def table_count(db: sqlite3.Connection, table: str) -> int:
         "paper_positions",
         "paper_settlements",
         "label_attempts",
+        "events",
+        "event_exposure_snapshots",
+        "contract_payouts",
+        "lifecycle_attribution",
+        "calibration_rows",
     }
     if table not in allowed:
         raise ValueError(f"unexpected table name: {table}")
@@ -403,6 +415,371 @@ def labeling_progress(db: sqlite3.Connection) -> dict[str, Any]:
         "recent_attempts": recent_attempts,
         "blockers": blockers,
     }
+
+
+def _bucket_edge(edge: Any) -> str:
+    if edge is None:
+        return "unknown"
+    value = float(edge)
+    if value < 0:
+        return "negative"
+    if value < 0.05:
+        return "0-5pct"
+    if value < 0.10:
+        return "5-10pct"
+    return "10pct_plus"
+
+
+def _delay_bucket(days: float) -> str:
+    if days <= 1:
+        return "0-1d"
+    if days <= 3:
+        return "2-3d"
+    if days <= 7:
+        return "4-7d"
+    return "8d_plus"
+
+
+def _close_bucket(minutes: Any) -> str:
+    try:
+        value = float(minutes)
+    except (TypeError, ValueError):
+        return "unknown"
+    if value <= 60:
+        return "0-1h"
+    if value <= 360:
+        return "1-6h"
+    if value <= 720:
+        return "6-12h"
+    return "12h_plus"
+
+
+def research_metrics(db: sqlite3.Connection) -> dict[str, Any]:
+    strategy_pnl: list[dict[str, Any]] = []
+    if table_exists(db, "paper_positions"):
+        strategy_pnl = [
+            row_dict(row)
+            for row in db.execute(
+                """
+                select coalesce(strategy_family, 'unknown') as strategy_family,
+                       count(*) as positions,
+                       sum(cost_basis) as cost_basis,
+                       sum(case when status='settled' then realized_pnl else (shares * coalesce(latest_mark, 0)) - cost_basis end) as pnl
+                from paper_positions
+                group by coalesce(strategy_family, 'unknown')
+                order by abs(coalesce(pnl, 0)) desc, strategy_family
+                """
+            ).fetchall()
+        ]
+
+    calibration_by_contract: list[dict[str, Any]] = []
+    if table_exists(db, "calibration_rows"):
+        calibration_by_contract = [
+            row_dict(row)
+            for row in db.execute(
+                """
+                select coalesce(contract_type, 'unknown') as contract_type,
+                       coalesce(strategy_family, 'unknown') as strategy_family,
+                       count(*) as rows,
+                       avg(brier) as brier,
+                       avg(log_loss) as log_loss
+                from calibration_rows
+                group by coalesce(contract_type, 'unknown'), coalesce(strategy_family, 'unknown')
+                order by rows desc, contract_type, strategy_family
+                limit 24
+                """
+            ).fetchall()
+        ]
+
+    edge_buckets: dict[str, dict[str, Any]] = {}
+    if table_exists(db, "training_rows"):
+        rows = db.execute(
+            """
+            select edge, model_prob, label_value
+            from training_rows
+            where edge is not null
+            """
+        ).fetchall()
+        for edge, model_prob, label_value in rows:
+            bucket = _bucket_edge(edge)
+            item = edge_buckets.setdefault(bucket, {"bucket": bucket, "rows": 0, "labeled_rows": 0, "brier": 0.0, "log_loss": 0.0})
+            item["rows"] += 1
+            if model_prob is not None and label_value in (0, 1, 0.0, 1.0):
+                prob = max(1e-6, min(1.0 - 1e-6, float(model_prob)))
+                label = float(label_value)
+                item["labeled_rows"] += 1
+                item["brier"] += (prob - label) * (prob - label)
+                item["log_loss"] += -(label * math.log(prob) + (1.0 - label) * math.log(1.0 - prob))
+        for item in edge_buckets.values():
+            labeled = int(item["labeled_rows"] or 0)
+            if labeled:
+                item["brier"] = item["brier"] / labeled
+                item["log_loss"] = item["log_loss"] / labeled
+            else:
+                item["brier"] = None
+                item["log_loss"] = None
+
+    fill_realism = {
+        "orders": table_count(db, "paper_orders"),
+        "fills": table_count(db, "paper_fills"),
+        "fill_rate": None,
+        "clob_fills": 0,
+        "displayed_price_fills": 0,
+        "avg_slippage": None,
+        "skipped_depth_orders": 0,
+    }
+    if table_exists(db, "paper_orders"):
+        orders = fill_realism["orders"]
+        fills = fill_realism["fills"]
+        fill_realism["fill_rate"] = None if not orders else fills / orders
+        fill_realism["skipped_depth_orders"] = int(
+            db.execute("select count(*) from paper_orders where reason like '%depth%' or reason like '%min_fill%'").fetchone()[0] or 0
+        )
+    if table_exists(db, "paper_fills"):
+        row = db.execute(
+            "select sum(case when source='clob_book' then 1 else 0 end), sum(case when source='displayed_price' then 1 else 0 end), avg(slippage) from paper_fills"
+        ).fetchone()
+        fill_realism["clob_fills"] = int(row[0] or 0)
+        fill_realism["displayed_price_fills"] = int(row[1] or 0)
+        fill_realism["avg_slippage"] = float(row[2]) if row and row[2] is not None else None
+
+    label_delay_histogram: dict[str, int] = {}
+    if table_exists(db, "training_rows"):
+        rows = db.execute(
+            """
+            select target_date, labeled_at
+            from training_rows
+            where target_date is not null and labeled_at is not null and label_status='final'
+            """
+        ).fetchall()
+        for target_date, labeled_at in rows:
+            try:
+                target_end = dt.datetime.fromisoformat(str(target_date)[:10] + "T23:59:59+00:00")
+                labeled = dt.datetime.fromisoformat(str(labeled_at))
+                if labeled.tzinfo is None:
+                    labeled = labeled.replace(tzinfo=dt.timezone.utc)
+                days = max(0.0, (labeled.astimezone(dt.timezone.utc) - target_end).total_seconds() / 86400.0)
+                label_delay_histogram[_delay_bucket(days)] = label_delay_histogram.get(_delay_bucket(days), 0) + 1
+            except ValueError:
+                label_delay_histogram["unknown"] = label_delay_histogram.get("unknown", 0) + 1
+
+    reaction_lag = {"avg_quote_age_seconds": None, "stale_quote_rows": 0, "rows": 0}
+    if table_exists(db, "signals") and column_exists(db, "signals", "quote_age_seconds"):
+        row = db.execute(
+            "select avg(quote_age_seconds), sum(coalesce(stale_book_flag,0)), count(*) from signals where quote_age_seconds is not null"
+        ).fetchone()
+        reaction_lag = {
+            "avg_quote_age_seconds": float(row[0]) if row and row[0] is not None else None,
+            "stale_quote_rows": int(row[1] or 0) if row else 0,
+            "rows": int(row[2] or 0) if row else 0,
+        }
+
+    ladder_violations: list[dict[str, Any]] = []
+    if table_exists(db, "signals") and column_exists(db, "signals", "ladder_violation_type"):
+        ladder_violations = [
+            row_dict(row)
+            for row in db.execute(
+                """
+                select coalesce(ladder_violation_type, 'none') as violation, count(*) as rows
+                from signals
+                group by coalesce(ladder_violation_type, 'none')
+                order by rows desc, violation
+                limit 12
+                """
+            ).fetchall()
+        ]
+
+    station_source_disagreement = []
+    if table_exists(db, "training_rows"):
+        station_source_disagreement = [
+            row_dict(row)
+            for row in db.execute(
+                """
+                select coalesce(source_confidence, 'unknown') as source_confidence,
+                       coalesce(eligibility_class, 'unknown') as eligibility_class,
+                       count(*) as rows
+                from training_rows
+                group by coalesce(source_confidence, 'unknown'), coalesce(eligibility_class, 'unknown')
+                order by rows desc
+                limit 12
+                """
+            ).fetchall()
+        ]
+
+    time_to_local_close: dict[str, int] = {}
+    if table_exists(db, "training_rows") and column_exists(db, "training_rows", "features_json"):
+        for (features_json,) in db.execute("select features_json from training_rows where features_json is not null").fetchall():
+            try:
+                payload = json.loads(features_json or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            bucket = _close_bucket(payload.get("minutes_until_local_end_of_day"))
+            time_to_local_close[bucket] = time_to_local_close.get(bucket, 0) + 1
+
+    rule_ambiguity_loss = []
+    if table_exists(db, "training_rows"):
+        rule_ambiguity_loss = [
+            row_dict(row)
+            for row in db.execute(
+                """
+                select coalesce(eligibility_class, 'unknown') as eligibility_class,
+                       count(*) as rows,
+                       avg(case when label_value in (0,1) and model_prob is not null then (model_prob - label_value) * (model_prob - label_value) end) as brier
+                from training_rows
+                group by coalesce(eligibility_class, 'unknown')
+                order by rows desc
+                """
+            ).fetchall()
+        ]
+
+    lifecycle_funnel = {
+        "candidates": table_count(db, "lifecycle_attribution"),
+        "signals": table_count(db, "signals"),
+        "training_rows": table_count(db, "training_rows"),
+        "orders": table_count(db, "paper_orders"),
+        "fills": table_count(db, "paper_fills"),
+        "labels": int(db.execute(f"select count(*) from training_rows where {tuning_evaluator.FINAL_LABEL_WHERE}").fetchone()[0] or 0) if table_exists(db, "training_rows") else 0,
+        "calibration_rows": table_count(db, "calibration_rows"),
+        "settlements": table_count(db, "paper_settlements"),
+    }
+
+    event_exposure_latent_summary = []
+    if table_exists(db, "events"):
+        event_exposure_latent_summary = [
+            row_dict(row)
+            for row in db.execute(
+                """
+                select event_key, city, target_date, station_id,
+                       latent_final_high_mean_f, latent_final_high_sigma_f,
+                       observed_high_f, local_day_complete, open_exposure,
+                       open_position_count, contract_count
+                from events
+                order by open_exposure desc, last_seen desc
+                limit 20
+                """
+            ).fetchall()
+        ]
+
+    return {
+        "strategy_pnl": strategy_pnl,
+        "edge_buckets": sorted(edge_buckets.values(), key=lambda item: item["bucket"]),
+        "calibration_by_contract": calibration_by_contract,
+        "fill_realism": fill_realism,
+        "label_delay_histogram": label_delay_histogram,
+        "reaction_lag_stale_quote": reaction_lag,
+        "ladder_violations": ladder_violations,
+        "station_source_disagreement": station_source_disagreement,
+        "time_to_local_close": time_to_local_close,
+        "rule_ambiguity_loss": rule_ambiguity_loss,
+        "lifecycle_funnel": lifecycle_funnel,
+        "event_exposure_latent_summary": event_exposure_latent_summary,
+    }
+
+
+def render_research_metrics_panel(metrics: dict[str, Any]) -> str:
+    strategy_rows = [
+        [
+            escape(row.get("strategy_family")),
+            f'<span class="num">{escape(fmt_num(row.get("positions")))}</span>',
+            f'<span class="num">{escape(fmt_money(row.get("cost_basis")))}</span>',
+            f'<span class="num {escape(tone_for(float(row.get("pnl") or 0.0)))}">{escape(fmt_money(row.get("pnl"), signed=True))}</span>',
+        ]
+        for row in metrics.get("strategy_pnl", [])
+    ]
+    calibration_rows = [
+        [
+            escape(row.get("contract_type")),
+            escape(row.get("strategy_family")),
+            f'<span class="num">{escape(fmt_num(row.get("rows")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("brier"), 3))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("log_loss"), 3))}</span>',
+        ]
+        for row in metrics.get("calibration_by_contract", [])
+    ]
+    edge_rows = [
+        [
+            escape(row.get("bucket")),
+            f'<span class="num">{escape(fmt_num(row.get("rows")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("labeled_rows")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("brier"), 3))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("log_loss"), 3))}</span>',
+        ]
+        for row in metrics.get("edge_buckets", [])
+    ]
+    ladder_rows = [
+        [escape(row.get("violation")), f'<span class="num">{escape(fmt_num(row.get("rows")))}</span>']
+        for row in metrics.get("ladder_violations", [])
+    ]
+    event_rows = [
+        [
+            f'<span class="title-cell">{escape(row.get("city"))}</span><br><span class="muted">{escape(row.get("target_date"))} {escape(row.get("station_id"))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("latent_final_high_mean_f"), 1))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("latent_final_high_sigma_f"), 1))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("observed_high_f"), 1))}</span>',
+            f'<span class="num">{escape(fmt_money(row.get("open_exposure")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("contract_count")))}</span>',
+        ]
+        for row in metrics.get("event_exposure_latent_summary", [])
+    ]
+    fill = metrics.get("fill_realism") or {}
+    reaction = metrics.get("reaction_lag_stale_quote") or {}
+    funnel = metrics.get("lifecycle_funnel") or {}
+    delay = metrics.get("label_delay_histogram") or {}
+    close = metrics.get("time_to_local_close") or {}
+    return f"""
+      <div class="panel-header">
+        <div>
+          <h2>Research Metrics</h2>
+          <p>Calibration and Brier/log loss lead post-label evaluation; paper return stays secondary.</p>
+        </div>
+        {status_pill("proposal-only")}
+      </div>
+      <div class="tuning-grid compact">
+        <div>
+          <h3>Fill Realism</h3>
+          <dl class="metric-list">
+            <div><dt>Fill Rate</dt><dd>{escape(fmt_pct(fill.get("fill_rate")))}</dd></div>
+            <div><dt>CLOB Fills</dt><dd>{escape(fmt_num(fill.get("clob_fills")))} / {escape(fmt_num(fill.get("fills")))}</dd></div>
+            <div><dt>Avg Slippage</dt><dd>{escape(fmt_price(fill.get("avg_slippage")))}</dd></div>
+            <div><dt>Depth Skips</dt><dd>{escape(fmt_num(fill.get("skipped_depth_orders")))}</dd></div>
+          </dl>
+        </div>
+        <div>
+          <h3>Timing</h3>
+          <dl class="metric-list">
+            <div><dt>Quote Age</dt><dd>{escape(fmt_num(reaction.get("avg_quote_age_seconds"), 1))}s avg</dd></div>
+            <div><dt>Stale Quotes</dt><dd>{escape(fmt_num(reaction.get("stale_quote_rows")))} / {escape(fmt_num(reaction.get("rows")))}</dd></div>
+            <div><dt>Label Delay</dt><dd>{escape(json.dumps(delay, sort_keys=True))}</dd></div>
+            <div><dt>Local Close</dt><dd>{escape(json.dumps(close, sort_keys=True))}</dd></div>
+          </dl>
+        </div>
+      </div>
+      <div class="split">
+        <div>
+          <h3>Strategy PnL</h3>
+          {render_table(["Strategy", "Positions", "Cost", "PnL"], strategy_rows, "No strategy PnL yet.")}
+        </div>
+        <div>
+          <h3>Calibration By Contract</h3>
+          {render_table(["Contract", "Strategy", "Rows", "Brier", "Log Loss"], calibration_rows, "No calibration rows yet.")}
+        </div>
+      </div>
+      <div class="split">
+        <div>
+          <h3>Edge Buckets</h3>
+          {render_table(["Bucket", "Rows", "Labels", "Brier", "Log Loss"], edge_rows, "No edge buckets yet.")}
+        </div>
+        <div>
+          <h3>Ladder Violations</h3>
+          {render_table(["Violation", "Rows"], ladder_rows, "No ladder violations recorded.")}
+        </div>
+      </div>
+      <div class="table-section">
+        <h3>Event Exposure and Latent Final High</h3>
+        {render_table(["Event", "Mean F", "Sigma", "Observed", "Exposure", "Contracts"], event_rows, "No event exposure rows yet.")}
+      </div>
+      <p class="muted">Lifecycle funnel: {escape(json.dumps(funnel, sort_keys=True))}</p>
+    """
 
 
 def signal_mix(db: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -935,6 +1312,7 @@ def render_tuning_iterations_section(iterations: Sequence[dict[str, Any]], itera
             f"return {fmt_pct(metrics.get('return_pct'), signed=True)}; "
             f"drawdown {fmt_pct(metrics.get('drawdown'))}; "
             f"brier {fmt_num(metrics.get('brier_score'), 3)}; "
+            f"log loss {fmt_num(metrics.get('log_loss'), 3)}; "
             f"unresolved {fmt_pct(metrics.get('unresolved_rate'))}; "
             f"labels={'yes' if labeling.get('labels_available') else 'no'}; "
             f"settlements {fmt_num(labeling.get('paper_settlements') if labeling else metrics.get('paper_settlements'))}"
@@ -1393,6 +1771,7 @@ def build_snapshot(
     metrics = portfolio_metrics(db)
     progress = evaluation_progress(db)
     label_progress = labeling_progress(db)
+    research = research_metrics(db)
     tuning_state = tuning_evaluator.evaluate_tuning_state(db_path=db_path)
     tuning_iterations = tuning_evaluator.load_tuning_iterations(iteration_log_path)
     if not tuning_iterations:
@@ -1412,6 +1791,8 @@ def build_snapshot(
         "fills": table_count(db, "paper_fills"),
         "positions": table_count(db, "paper_positions"),
         "label attempts": table_count(db, "label_attempts"),
+        "events": table_count(db, "events"),
+        "calibration rows": table_count(db, "calibration_rows"),
     }
     expanded_counts = {
         "runs": table_count(db, "runs"),
@@ -1420,6 +1801,9 @@ def build_snapshot(
         "order books": table_count(db, "orderbook_snapshots"),
         "settlements": table_count(db, "paper_settlements"),
         "accounts": table_count(db, "paper_accounts"),
+        "contract payouts": table_count(db, "contract_payouts"),
+        "event snapshots": table_count(db, "event_exposure_snapshots"),
+        "lifecycle rows": table_count(db, "lifecycle_attribution"),
     }
     paper_buy_count = db.execute(
         "select count(*) from signals where coalesce(signal_type, '') like 'paper_buy%'"
@@ -1561,6 +1945,7 @@ def build_snapshot(
         "evidence_progress": evidence_progress,
         "equity_chart": equity_svg(snapshot_rows, float(metrics["starting_cash"])),
         "labeling_settlement_panel": render_labeling_settlement_panel(label_progress),
+        "research_metrics_panel": render_research_metrics_panel(research),
         "tuning_section": render_tuning_section(tuning_state, metrics, progress),
         "tuning_iterations_section": render_tuning_iterations_section(tuning_iterations, iteration_log_path),
         "data_sources_feature_tuning_panel": render_source_feature_tuning_panel(tuning_state),
@@ -1602,6 +1987,7 @@ def build_snapshot(
         "metrics": dict(metrics),
         "progress": dict(progress),
         "labeling_settlement": dict(label_progress),
+        "research_metrics": research,
         "tuning_performance": {
             "state": tuning_state,
             "current_metrics": {
@@ -1714,6 +2100,10 @@ def build_html_from_snapshot(snapshot: dict[str, Any]) -> str:
 
   <section class="panel table-section" aria-label="Labeling and settlement progress" data-live-fragment="labeling_settlement_panel">
     {fragments["labeling_settlement_panel"]}
+  </section>
+
+  <section class="panel table-section" aria-label="Research metrics" data-live-fragment="research_metrics_panel">
+    {fragments["research_metrics_panel"]}
   </section>
 
   <section class="panel table-section" aria-label="Tuning readiness and performance traces" data-live-fragment="tuning_section">
