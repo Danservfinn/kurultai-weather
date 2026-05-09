@@ -19,6 +19,7 @@ import sqlite3
 from collections.abc import Sequence
 from typing import Any
 
+import edge_validation
 import tuning_evaluator
 
 
@@ -1113,6 +1114,46 @@ def render_source_feature_tuning_panel(tuning_state: dict[str, Any]) -> str:
     """
 
 
+
+def render_strategy_family_survival_panel(rows: list[dict[str, Any]]) -> str:
+    promote = sum(1 for r in rows if r.get("verdict") == edge_validation.PROMOTE_PAPER_SIZE)
+    killed = sum(1 for r in rows if r.get("verdict") == edge_validation.KILL_OR_DISABLE)
+    disabled = sum(1 for r in rows if r.get("verdict") != edge_validation.PROMOTE_PAPER_SIZE)
+    summary_cards = "".join([
+        stat_card("Families", fmt_num(len(rows)), "Strategy buckets with evidence", "neutral"),
+        stat_card("Promotable", fmt_num(promote), "Passes survival gate", "positive" if promote else "neutral"),
+        stat_card("Disabled", fmt_num(disabled), "Blocked from new paper fills by default", "warning" if disabled else "neutral"),
+        stat_card("Killed", fmt_num(killed), "Failed survival criteria", "negative" if killed else "neutral"),
+    ])
+    table_rows: list[list[str]] = []
+    for row in rows[:16]:
+        verdict = str(row.get("verdict") or "-")
+        table_rows.append([
+            f'<strong>{escape(row.get("strategy_family"))}</strong>',
+            status_pill(verdict),
+            f'<span class="num">{escape(fmt_num(row.get("survival_score"), 3))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("resolved_count")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("sample_days")))}</span>',
+            f'<span class="num {escape(tone_for(float(row.get("realized_pnl") or 0.0)))}">{escape(fmt_money(row.get("realized_pnl"), signed=True))}</span>',
+            f'<span class="num {escape(tone_for(float(row.get("roi") or 0.0)))}">{escape(fmt_pct(row.get("roi"), signed=True))}</span>',
+            f'<span class="num {escape(tone_for(float(row.get("brier_delta") or 0.0)))}">{escape(fmt_num(row.get("brier_delta"), 4))}</span>',
+            f'<span class="num">{escape(fmt_pct(row.get("edge_decile_persistence")))}</span>',
+            f'<span class="num">{escape(fmt_pct(row.get("execution_realism")))}</span>',
+            f'<span class="num">{escape(fmt_pct(row.get("ambiguity_control")))}</span>',
+        ])
+    return f"""
+      <div class="panel-header">
+        <div>
+          <h2>Strategy Family Survival</h2>
+          <p>Family-level paper edge validation: realized PnL, calibration advantage, edge-decile persistence, execution realism, and ambiguity control. Non-promoted families are disabled for new paper fills by default.</p>
+        </div>
+        {status_pill("paper gate")}
+      </div>
+      <div class="grid stats compact">{summary_cards}</div>
+      {render_table(["Family", "Verdict", "Score", "Resolved", "Days", "PnL", "ROI", "Brier Δ", "Decile persistence", "Execution", "Ambiguity"], table_rows, "No strategy-family survival rows yet.")}
+      <p class="muted">Promotion target: {edge_validation.RESOLVED_TARGET} resolved rows and {edge_validation.DAY_TARGET} sample days, positive realized PnL, positive model-vs-market Brier delta, persistent edge deciles, clean labels, and executable fills.</p>
+    """
+
 def render_labeling_settlement_panel(progress: dict[str, Any]) -> str:
     status_counts = progress.get("attempt_status_counts") or {}
     coverage_rows = [
@@ -1773,6 +1814,7 @@ def build_snapshot(
     label_progress = labeling_progress(db)
     research = research_metrics(db)
     tuning_state = tuning_evaluator.evaluate_tuning_state(db_path=db_path)
+    survival_rows = edge_validation.evaluate_strategy_families(db_path=db_path, persist=False)
     tuning_iterations = tuning_evaluator.load_tuning_iterations(iteration_log_path)
     if not tuning_iterations:
         tuning_iterations = [
@@ -1947,6 +1989,7 @@ def build_snapshot(
         "labeling_settlement_panel": render_labeling_settlement_panel(label_progress),
         "research_metrics_panel": render_research_metrics_panel(research),
         "tuning_section": render_tuning_section(tuning_state, metrics, progress),
+        "strategy_family_survival_panel": render_strategy_family_survival_panel(survival_rows),
         "tuning_iterations_section": render_tuning_iterations_section(tuning_iterations, iteration_log_path),
         "data_sources_feature_tuning_panel": render_source_feature_tuning_panel(tuning_state),
         "tunables_table": render_tunables_table(tuning_state),
@@ -1988,6 +2031,14 @@ def build_snapshot(
         "progress": dict(progress),
         "labeling_settlement": dict(label_progress),
         "research_metrics": research,
+        "strategy_family_survival": {
+            "rows": survival_rows,
+            "thresholds": {
+                "resolved_target": edge_validation.RESOLVED_TARGET,
+                "day_target": edge_validation.DAY_TARGET,
+            },
+            "weights": edge_validation.SURVIVAL_WEIGHTS,
+        },
         "tuning_performance": {
             "state": tuning_state,
             "current_metrics": {
@@ -2108,6 +2159,10 @@ def build_html_from_snapshot(snapshot: dict[str, Any]) -> str:
 
   <section class="panel table-section" aria-label="Tuning readiness and performance traces" data-live-fragment="tuning_section">
     {fragments["tuning_section"]}
+  </section>
+
+  <section class="panel table-section" aria-label="Strategy family survival" data-live-fragment="strategy_family_survival_panel">
+    {fragments["strategy_family_survival_panel"]}
   </section>
 
   <section class="panel table-section" aria-label="Tuning iteration performance" data-live-fragment="tuning_iterations_section">

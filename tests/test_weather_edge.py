@@ -171,6 +171,25 @@ class WeatherEdgeTests(unittest.TestCase):
             "forecast_distribution_directional",
         )
 
+    def test_paper_buy_survival_gate_disables_non_promoted_family_by_default(self):
+        args = argparse.Namespace(allow_weak_families=False, disable_weak_families=True)
+        original = scanner.edge_validation.disabled_families
+        scanner.edge_validation.disabled_families = lambda _path: {"ladder_inconsistency"}
+        try:
+            self.assertTrue(scanner.paper_buy_survival_gate_disabled(args, "ladder_inconsistency"))
+            self.assertFalse(scanner.paper_buy_survival_gate_disabled(args, "forecast_distribution_directional"))
+        finally:
+            scanner.edge_validation.disabled_families = original
+
+    def test_paper_buy_survival_gate_can_be_overridden_for_research_smoke(self):
+        args = argparse.Namespace(allow_weak_families=True, disable_weak_families=True)
+        original = scanner.edge_validation.disabled_families
+        scanner.edge_validation.disabled_families = lambda _path: {"ladder_inconsistency"}
+        try:
+            self.assertFalse(scanner.paper_buy_survival_gate_disabled(args, "ladder_inconsistency"))
+        finally:
+            scanner.edge_validation.disabled_families = original
+
     def test_ladder_diagnostics_flags_gaps(self):
         rows = [
             {"outcome": "80F", "model_prob": 0.20, "entry_price": 0.20},

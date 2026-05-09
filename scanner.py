@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import edge_validation
 import features
 import settlement_states
 import tuning_evaluator
@@ -2645,6 +2646,30 @@ def city_date_exposure(db: sqlite3.Connection, account_id: int, city: str | None
     return float(row[0] or 0.0)
 
 
+def paper_buy_survival_gate_disabled(args: argparse.Namespace, strategy_family: str) -> bool:
+    """Return True when paper-buy orders for a strategy family should be skipped.
+
+    The gate is paper-only: it does not affect signal/training-row collection.
+    By default, families that fail the Strategy Family Survival evidence gate
+    (anything other than PROMOTE_PAPER_SIZE) are prevented from consuming the
+    paper ledger until they earn promotion.
+    """
+    if getattr(args, "allow_weak_families", False):
+        return False
+    if not getattr(args, "disable_weak_families", False):
+        return False
+    family = (strategy_family or "unknown").strip() or "unknown"
+    cache = getattr(args, "_paper_buy_disabled_families", None)
+    if cache is None:
+        try:
+            cache = edge_validation.disabled_families(DB_PATH)
+        except Exception as exc:  # dashboard/reporting data must not break scan collection
+            cache = set()
+            setattr(args, "_paper_buy_survival_gate_error", str(exc))
+        setattr(args, "_paper_buy_disabled_families", cache)
+    return family in cache
+
+
 def simulate_paper_order(
     db: sqlite3.Connection,
     args: argparse.Namespace,
@@ -2676,6 +2701,8 @@ def simulate_paper_order(
     shares = 0.0
     if not token_id:
         reason = "missing_token_id"
+    elif paper_buy_survival_gate_disabled(args, strategy_family):
+        reason = "strategy_family_survival_gate_disabled"
     elif quote.get("execution_source") != "clob_book" or not quote.get("depth_sufficient"):
         reason = "no_executable_clob_depth"
     elif entry is None or entry <= 0.0:
@@ -4428,6 +4455,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--min-entry", type=float, default=float(os.environ.get("MIN_ENTRY", "0.02")), help="Skip dust/stale paper entries below this executable price")
     s.add_argument("--enable-wu", action="store_true", default=env_bool("ENABLE_WU", False), help="Attempt slow/best-effort Weather Underground station reads; default off for cron reliability")
     s.add_argument("--disable-ledger", action="store_true", help="Do not write simulated paper orders/fills/positions for this scan")
+    s.add_argument("--allow-weak-families", action="store_true", help="Allow paper ledger fills for strategy families that have not passed the survival gate")
+    s.set_defaults(disable_weak_families=True)
     s.add_argument("--max-position-pct", type=float, default=float(os.environ.get("MAX_POSITION_PCT", "0.02")), help="Max simulated cash exposure per market position")
     s.add_argument("--max-city-date-pct", type=float, default=float(os.environ.get("MAX_CITY_DATE_PCT", "0.10")), help="Max simulated cash exposure per city/date")
     s.add_argument("--max-open-exposure-pct", type=float, default=float(os.environ.get("MAX_OPEN_EXPOSURE_PCT", "0.50")), help="Max simulated open exposure")
