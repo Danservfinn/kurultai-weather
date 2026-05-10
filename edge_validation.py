@@ -39,6 +39,20 @@ SURVIVAL_WEIGHTS = {
     "ambiguity_control": 0.10,
 }
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_weather.sqlite3")
+SQLITE_BUSY_TIMEOUT_MS = 5000
+
+
+def connect_db(db_path: str, *, readonly: bool) -> sqlite3.Connection:
+    timeout_seconds = SQLITE_BUSY_TIMEOUT_MS / 1000.0
+    if readonly and os.path.exists(db_path):
+        uri = f"file:{os.path.abspath(db_path)}?mode=ro"
+        db = sqlite3.connect(uri, timeout=timeout_seconds, uri=True, isolation_level=None)
+    else:
+        db = sqlite3.connect(db_path, timeout=timeout_seconds, isolation_level=None)
+        db.execute("pragma journal_mode=WAL")
+    db.execute(f"pragma busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    db.row_factory = sqlite3.Row
+    return db
 
 
 def clamp(value: float | None, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -219,8 +233,7 @@ def verdict_for(row: dict[str, Any]) -> str:
 
 
 def evaluate_strategy_families(db_path: str = DEFAULT_DB_PATH, *, persist: bool = False) -> list[dict[str, Any]]:
-    db = sqlite3.connect(db_path)
-    db.row_factory = sqlite3.Row
+    db = connect_db(db_path, readonly=not persist)
     training = read_all(db, "training_rows")
     signals = read_all(db, "signals")
     fills_by_candidate = read_fills_by_candidate(db)

@@ -134,6 +134,56 @@ class RenderBrainPerformanceTests(unittest.TestCase):
             self.assertIn("safety_ok=true", html)
             self.assertIn("dashboard.json", html)
 
+    def test_render_uses_readonly_connection_while_writer_is_active(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "paper.sqlite3")
+            writer = scanner.init_db(db_path)
+            writer.execute(
+                "insert into runs(started_at, source_url, markets_seen, signals_seen) values (?, ?, ?, ?)",
+                ("2026-05-09T00:00:00+00:00", "https://polymarket.com/climate-science/weather", 1, 2),
+            )
+            writer.execute("begin immediate")
+            try:
+                html_path = os.path.join(td, "dashboard.html")
+                json_path = os.path.join(td, "dashboard.json")
+                html_out, json_out = render_brain_performance.render(db_path, html_path, json_path, os.path.join(td, "iterations.jsonl"))
+            finally:
+                writer.execute("rollback")
+                writer.close()
+
+            self.assertEqual(html_out, html_path)
+            self.assertEqual(json_out, json_path)
+            with open(json_path, encoding="utf-8") as f:
+                snapshot = json.load(f)
+            self.assertEqual(snapshot["latest_runs"][0]["markets_seen"], 1)
+
+    def test_dashboard_counts_source_status_reasons(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "paper.sqlite3")
+            db = scanner.init_db(db_path)
+            for provider, status in (("nws", "error"), ("iem_metar", "missing_daily_high"), ("noaa_ncei", "ok")):
+                scanner.record_source_observation_snapshot(
+                    db,
+                    run_id=1,
+                    market_id="m-source",
+                    event_key="event-source",
+                    provider=provider,
+                    family="observation",
+                    status=status,
+                    station_id="KDEN",
+                    fetched_at="2026-05-10T12:00:00+00:00",
+                    error="simulated" if status == "error" else None,
+                )
+            db.close()
+
+            html_path = os.path.join(td, "dashboard.html")
+            json_path = os.path.join(td, "dashboard.json")
+            render_brain_performance.render(db_path, html_path, json_path, os.path.join(td, "iterations.jsonl"))
+            with open(json_path, encoding="utf-8") as f:
+                snapshot = json.load(f)
+            rows = snapshot["research_metrics"]["source_adapter_status"]["by_status"]
+            self.assertEqual({(row["source_provider"], row["status"]) for row in rows}, {("nws", "error"), ("iem_metar", "missing_daily_high"), ("noaa_ncei", "ok")})
+
 
 if __name__ == "__main__":
     unittest.main()

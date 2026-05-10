@@ -45,6 +45,7 @@ WU_STATION_RE = re.compile(r"(?:stationId=|station=|/pws/|/history/[a-z]+/)([A-Z
 DUST_PRICE = 0.001
 DEFAULT_ACCOUNT_NAME = "default-paper"
 DEFAULT_BANKROLL_USD = 1000.0
+SQLITE_BUSY_TIMEOUT_MS = 5000
 RAW_EXCERPT_LIMIT = 4000
 RAW_JSON_LIMIT = 20000
 FINAL_LABEL_STATUS = "final"
@@ -112,6 +113,7 @@ STRATEGY_FAMILIES = {
     "complement_arb",
     "ladder_inconsistency",
     "settlement_source_edge",
+    "settlement_source_delta",
     "diurnal_nowcast",
     "forecast_distribution_directional",
     "watch",
@@ -129,6 +131,27 @@ PROHIBITED_LIVE_ARG_NAMES = (
     "api_key",
     "secret",
 )
+
+
+def connect_sqlite(path: str, *, readonly: bool = False, row_factory: bool = False) -> sqlite3.Connection:
+    """Open SQLite with the engine's lock policy.
+
+    Write connections run in autocommit mode so scanner network fetches cannot
+    accidentally hold a transaction open between statements. Multi-statement
+    ledger updates remain paper-only and bounded; each statement is committed
+    before the next public HTTP request can run.
+    """
+    timeout_seconds = SQLITE_BUSY_TIMEOUT_MS / 1000.0
+    if readonly and os.path.exists(path):
+        uri = f"file:{os.path.abspath(path)}?mode=ro"
+        db = sqlite3.connect(uri, timeout=timeout_seconds, uri=True, isolation_level=None)
+    else:
+        db = sqlite3.connect(path, timeout=timeout_seconds, isolation_level=None)
+        db.execute("pragma journal_mode=WAL")
+    db.execute(f"pragma busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    if row_factory:
+        db.row_factory = sqlite3.Row
+    return db
 DEFAULT_GOAL_TEXT = """# Paper-only optimization goal scaffold.
 # This file is intentionally declarative. The tune command only proposes
 # candidate config values from historical paper data; it does not deploy,
@@ -1610,6 +1633,8 @@ def classify_strategy_family(
         return "skip"
     if raw_signal.startswith("watch"):
         return "watch"
+    if "source_delta" in raw_signal or settlement_state == "source_delta":
+        return "settlement_source_delta"
     if complement_status == "complement_arb" or "complement_arb" in raw_signal:
         return "complement_arb"
     if ladder_status == "ladder_violation" or "ladder" in raw_signal:
@@ -1631,8 +1656,7 @@ def classify_strategy_family(
 
 
 def init_db(path: str) -> sqlite3.Connection:
-    db = sqlite3.connect(path, timeout=30.0)
-    db.execute("pragma busy_timeout=30000")
+    db = connect_sqlite(path)
     db.executescript(
         """
         create table if not exists runs (
@@ -1657,6 +1681,24 @@ def init_db(path: str) -> sqlite3.Connection:
           id integer primary key, city_key text not null, station_id text not null,
           station_name text, source_url text, timezone text, reliability text,
           active integer not null default 1, note text, updated_at text not null
+        );
+        create table if not exists settlement_source_registry (
+          source_key text primary key, canonical_name text not null, family text not null,
+          provider text not null, station_id text, source_url text, priority integer not null default 100,
+          active integer not null default 1, created_at text not null, updated_at text not null
+        );
+        create table if not exists source_observation_snapshots (
+          id integer primary key, run_id integer, market_id text, event_key text,
+          source_key text, provider text not null, source_provider text,
+          family text not null, status text not null,
+          station_id text, observed_at text, fetched_at text not null, local_date text,
+          observed_high_f real, current_temp_f real, source_url text, provenance_json text,
+          raw_excerpt text, error text, created_at text not null
+        );
+        create table if not exists station_residuals (
+          id integer primary key, station_id text not null, source_key text, strategy_family text,
+          sample_count integer not null, mean_residual_f real not null, mae_f real not null,
+          rmse_f real not null, last_label_at text, updated_at text not null
         );
         create table if not exists forecast_snapshots (
           id integer primary key, run_id integer, market_id text, city text,
@@ -1852,6 +1894,9 @@ def init_db(path: str) -> sqlite3.Connection:
         create index if not exists idx_threshold_touch_events_detected on threshold_touch_events(scanner_detected_at);
         create index if not exists idx_post_touch_repricing_touch on post_touch_repricing(touch_event_id, observed_at);
         create index if not exists idx_post_touch_repricing_token on post_touch_repricing(token_id, observed_at);
+        create index if not exists idx_source_observation_snapshots_event on source_observation_snapshots(event_key, market_id, provider, created_at);
+        create index if not exists idx_source_observation_snapshots_status on source_observation_snapshots(status, provider, created_at);
+        create unique index if not exists idx_station_residuals_key on station_residuals(station_id, coalesce(source_key,''), coalesce(strategy_family,''));
         """
     )
     ensure_columns(
@@ -1983,6 +2028,16 @@ def init_db(path: str) -> sqlite3.Connection:
             "event_key": "text",
             "strategy_family": "text",
         },
+    )
+    ensure_columns(
+        db,
+        "source_observation_snapshots",
+        {
+            "source_provider": "text",
+        },
+    )
+    db.execute(
+        "update source_observation_snapshots set source_provider=provider where source_provider is null and provider is not null"
     )
     ensure_columns(
         db,
@@ -2762,6 +2817,198 @@ def city_date_exposure(db: sqlite3.Connection, account_id: int, city: str | None
     return float(row[0] or 0.0)
 
 
+def settlement_source_key(provider: str | None, station_id: str | None, source_url: str | None = None) -> str:
+    provider_part = re.sub(r"[^a-z0-9]+", "_", str(provider or "unknown").strip().lower()).strip("_") or "unknown"
+    station_part = re.sub(r"[^a-z0-9]+", "_", str(station_id or "unknown").strip().lower()).strip("_") or "unknown"
+    if source_url and station_part == "unknown":
+        parsed = urllib.parse.urlparse(str(source_url))
+        station_part = re.sub(r"[^a-z0-9]+", "_", (parsed.netloc or parsed.path or "source").lower()).strip("_") or "source"
+    return f"{provider_part}:{station_part}"
+
+
+def upsert_settlement_source_registry(
+    db: sqlite3.Connection,
+    *,
+    provider: str | None,
+    family: str | None,
+    station_id: str | None,
+    source_url: str | None,
+    canonical_name: str | None = None,
+    priority: int = 100,
+    now: str | None = None,
+) -> str:
+    now = now or utc_now_iso()
+    key = settlement_source_key(provider, station_id, source_url)
+    db.execute(
+        """
+        insert into settlement_source_registry(source_key, canonical_name, family, provider, station_id, source_url, priority, active, created_at, updated_at)
+        values(?,?,?,?,?,?,?,?,?,?)
+        on conflict(source_key) do update set
+          canonical_name=excluded.canonical_name,
+          family=excluded.family,
+          provider=excluded.provider,
+          station_id=excluded.station_id,
+          source_url=coalesce(excluded.source_url, settlement_source_registry.source_url),
+          priority=excluded.priority,
+          active=1,
+          updated_at=excluded.updated_at
+        """,
+        (key, canonical_name or str(provider or "unknown"), family or "observation", provider or "unknown", station_id, source_url, priority, 1, now, now),
+    )
+    return key
+
+
+def record_source_observation_snapshot(
+    db: sqlite3.Connection,
+    *,
+    run_id: int | None,
+    market_id: str | None,
+    event_key: str | None,
+    source_record: Any | None = None,
+    provider: str | None = None,
+    family: str | None = None,
+    status: str | None = None,
+    station_id: str | None = None,
+    observed_at: str | None = None,
+    fetched_at: str | None = None,
+    local_date: str | None = None,
+    observed_high_f: float | None = None,
+    current_temp_f: float | None = None,
+    source_url: str | None = None,
+    provenance: dict[str, Any] | None = None,
+    raw_excerpt: str | None = None,
+    error: str | None = None,
+    now: str | None = None,
+) -> int:
+    now = now or utc_now_iso()
+    data = getattr(source_record, "data", None) if source_record is not None else None
+    data = data if isinstance(data, dict) else {}
+    provider = provider or getattr(source_record, "provider", None) or "unknown"
+    family = family or getattr(source_record, "family", None) or "observation"
+    status = status or getattr(source_record, "status", None) or "skipped"
+    fetched_at = fetched_at or getattr(source_record, "fetched_at", None) or now
+    source_url = source_url or getattr(source_record, "source_url", None)
+    error = error or getattr(source_record, "error", None)
+    provenance = provenance or getattr(source_record, "provenance", None) or {}
+    station_id = station_id or data.get("station_id")
+    observed_at = observed_at or data.get("observed_at") or data.get("obs_time_utc")
+    local_date = local_date or data.get("local_date")
+    observed_high_f = observed_high_f if observed_high_f is not None else data.get("daily_high_f", data.get("high_so_far_f"))
+    current_temp_f = current_temp_f if current_temp_f is not None else data.get("current_temp_f")
+    source_key = upsert_settlement_source_registry(db, provider=provider, family=family, station_id=station_id, source_url=source_url, now=now)
+    raw_excerpt = None if raw_excerpt is None else str(raw_excerpt)[:RAW_EXCERPT_LIMIT]
+    cur = db.execute(
+        """
+        insert into source_observation_snapshots(
+          run_id, market_id, event_key, source_key, provider, source_provider, family, status, station_id,
+          observed_at, fetched_at, local_date, observed_high_f, current_temp_f, source_url,
+          provenance_json, raw_excerpt, error, created_at
+        ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            run_id, market_id, event_key, source_key, provider, provider, family, status, station_id,
+            observed_at, fetched_at, local_date,
+            float(observed_high_f) if observed_high_f is not None else None,
+            float(current_temp_f) if current_temp_f is not None else None,
+            source_url, bounded_json(provenance, RAW_JSON_LIMIT), raw_excerpt, error, now,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def source_delta_features(db: sqlite3.Connection, event_key: str | None, market_id: str | None = None) -> dict[str, Any]:
+    if not event_key and not market_id:
+        return {"source_delta_snapshot_count": 0, "source_delta_status": "missing_event"}
+    rows = db.execute(
+        """
+        select provider, status, observed_high_f, station_id, source_key, fetched_at
+        from source_observation_snapshots
+        where (? is null or event_key=?) and (? is null or market_id=?)
+        order by fetched_at desc, id desc
+        limit 10
+        """,
+        (event_key, event_key, market_id, market_id),
+    ).fetchall()
+    highs = [float(r[2]) for r in rows if r[2] is not None]
+    providers = sorted({str(r[0]) for r in rows if r[0]})
+    delta = max(highs) - min(highs) if len(highs) >= 2 else None
+    return {
+        "source_delta_snapshot_count": len(rows),
+        "source_delta_provider_count": len(providers),
+        "source_delta_providers": providers,
+        "source_delta_high_range_f": delta,
+        "source_delta_abs_max_f": max((abs(highs[i] - highs[j]) for i in range(len(highs)) for j in range(i)), default=None),
+        "source_delta_status": "ready" if len(highs) >= 2 else "insufficient_sources",
+        "source_delta_primary_station_id": rows[0][3] if rows else None,
+        "source_delta_primary_source_key": rows[0][4] if rows else None,
+    }
+
+
+def source_delta_probability(delta_f: float | None, *, calibration_count: int = 0) -> tuple[float | None, str]:
+    if calibration_count <= 0:
+        return None, "source_delta_shadow_no_calibration"
+    if delta_f is None:
+        return None, "source_delta_insufficient_sources"
+    return max(0.05, min(0.95, 0.5 + min(delta_f, 10.0) / 40.0)), "source_delta_deterministic_calibrated"
+
+
+def source_delta_official_guard(db: sqlite3.Connection, *, station_id: str | None, source_key: str | None = None) -> tuple[bool, str]:
+    if not station_id or not source_key:
+        return False, "source_delta_ambiguous_station_or_source"
+    labels = db.execute("select count(*) from label_attempts where outcome_status=?", (FINAL_LABEL_STATUS,)).fetchone()[0]
+    cals = db.execute("select count(*) from calibration_rows").fetchone()[0]
+    if int(labels or 0) < 300 or int(cals or 0) < 300:
+        return False, "source_delta_shadow_until_labels_and_calibration"
+    return True, "source_delta_official_allowed"
+
+
+def refresh_station_residuals(db: sqlite3.Connection, *, now: str | None = None) -> int:
+    now = now or utc_now_iso()
+    rows = db.execute(
+        """
+        select coalesce(tr.station_id, la.station_id) as station_id,
+               coalesce(sos.source_key, la.source_provider) as source_key,
+               coalesce(tr.strategy_family, 'unknown') as strategy_family,
+               (la.final_high_f - sos.observed_high_f) as residual_f,
+               la.attempted_at
+        from label_attempts la
+        join training_rows tr on tr.id=la.training_row_id
+        left join source_observation_snapshots sos
+          on (sos.event_key=tr.event_key or sos.market_id=tr.market_id)
+         and sos.observed_high_f is not null
+        where la.outcome_status=?
+          and la.final_high_f is not null
+          and sos.observed_high_f is not null
+          and coalesce(tr.station_id, la.station_id, '') <> ''
+        """,
+        (FINAL_LABEL_STATUS,),
+    ).fetchall()
+    grouped: dict[tuple[str, str, str], list[tuple[float, str | None]]] = {}
+    for station_id, source_key, strategy_family, residual, attempted_at in rows:
+        grouped.setdefault((str(station_id), str(source_key or "unknown"), str(strategy_family or "unknown")), []).append((float(residual), attempted_at))
+    for (station_id, source_key, strategy_family), vals in grouped.items():
+        residuals = [v[0] for v in vals]
+        mean = sum(residuals) / len(residuals)
+        mae = sum(abs(v) for v in residuals) / len(residuals)
+        rmse = math.sqrt(sum(v * v for v in residuals) / len(residuals))
+        last_label_at = max((v[1] for v in vals if v[1]), default=None)
+        db.execute(
+            """
+            insert into station_residuals(station_id, source_key, strategy_family, sample_count, mean_residual_f, mae_f, rmse_f, last_label_at, updated_at)
+            values(?,?,?,?,?,?,?,?,?)
+            on conflict(station_id, coalesce(source_key,''), coalesce(strategy_family,'')) do update set
+              sample_count=excluded.sample_count,
+              mean_residual_f=excluded.mean_residual_f,
+              mae_f=excluded.mae_f,
+              rmse_f=excluded.rmse_f,
+              last_label_at=excluded.last_label_at,
+              updated_at=excluded.updated_at
+            """,
+            (station_id, source_key, strategy_family, len(residuals), mean, mae, rmse, last_label_at, now),
+        )
+    return len(grouped)
+
+
 def paper_buy_survival_gate_disabled(args: argparse.Namespace, strategy_family: str) -> bool:
     """Return True when paper-buy orders for a strategy family should be skipped.
 
@@ -2876,9 +3123,16 @@ def record_shadow_survival_gate_fill(
     return shadow_order_id, int(db.execute("select last_insert_rowid()").fetchone()[0])
 
 
-def paper_buy_shadow_only_family(args: argparse.Namespace, family: str) -> tuple[bool, str | None]:
-    if family == "ladder_inconsistency" and getattr(args, "shadow_ladder_inconsistency", True):
-        return True, "ladder_inconsistency_shadow_only"
+def paper_buy_shadow_only_family(
+    args: argparse.Namespace,
+    family: str,
+    *,
+    db: sqlite3.Connection | None = None,
+) -> tuple[bool, str | None]:
+    if family == "settlement_source_delta":
+        return True, "settlement_source_delta_shadow_until_labels"
+    if family == "ladder_inconsistency":
+        return ladder_shadow_gate(db, args)
     configured = getattr(args, "shadow_strategy_families", None)
     if isinstance(configured, str):
         families = {item.strip() for item in configured.split(",") if item.strip()}
@@ -2939,6 +3193,40 @@ def seed_touch_watchlist_candidate(
     touch_watchlist.upsert_touch_watchlist(db, candidate, hotness)
 
 
+def official_paper_fill_gate(args: argparse.Namespace, quote: dict[str, Any]) -> tuple[bool, str]:
+    entry = quote.get("entry_price")
+    try:
+        entry_float = float(entry) if entry is not None else None
+    except (TypeError, ValueError):
+        entry_float = None
+    if entry_float is None or entry_float <= 0.0:
+        return False, "missing_entry_price"
+    if entry_float < float(getattr(args, "min_entry", 0.02)):
+        return False, "below_min_entry_shadow_only"
+    if entry_float > float(getattr(args, "max_entry", 0.95)):
+        return False, "above_max_entry"
+    if quote.get("execution_source") != "clob_book":
+        return False, "execution_not_clob_book"
+    if not bool(quote.get("depth_sufficient")):
+        return False, "insufficient_executable_depth"
+    if quote.get("quote_age_seconds") is None:
+        return False, "missing_quote_age"
+    if bool(quote.get("stale_book_flag")):
+        return False, "stale_book"
+    spread = quote.get("spread")
+    if spread is not None and float(spread) > float(getattr(args, "max_spread", 1.0)):
+        return False, "spread_above_max_spread"
+    return True, "paper_fill_executable_clob"
+
+
+def ladder_shadow_gate(db: sqlite3.Connection | None, args: argparse.Namespace) -> tuple[bool, str | None]:
+    if db is not None and table_exists(db, "calibration_rows") and table_count(db, "calibration_rows") < 300:
+        return True, "ladder_shadow_until_labels"
+    if getattr(args, "shadow_ladder_inconsistency", True):
+        return True, "ladder_inconsistency_shadow_only"
+    return False, None
+
+
 def simulate_paper_order(
     db: sqlite3.Connection,
     args: argparse.Namespace,
@@ -2970,7 +3258,8 @@ def simulate_paper_order(
     except (TypeError, ValueError):
         entry_float = None
     requested = float(getattr(args, "paper_size", 0.0) or 0.0)
-    shadow_only, shadow_reason = paper_buy_shadow_only_family(args, strategy_family)
+    shadow_only, shadow_reason = paper_buy_shadow_only_family(args, strategy_family, db=db)
+    official_allowed, official_reason = official_paper_fill_gate(args, quote)
     status = "skipped"
     reason = ""
     shares = 0.0
@@ -2978,8 +3267,24 @@ def simulate_paper_order(
         reason = "missing_token_id"
     elif entry_float is None or entry_float <= 0.0:
         reason = "missing_entry_price"
-    elif entry_float < float(getattr(args, "min_entry", 0.02)):
-        reason = "entry_below_min_entry"
+    elif not official_allowed and official_reason == "below_min_entry_shadow_only":
+        reason = official_reason
+        record_shadow_survival_gate_fill(
+            db,
+            run_id,
+            signal_id,
+            created_at,
+            m,
+            outcome,
+            token_id,
+            signal_type,
+            quote,
+            requested,
+            event_key,
+            candidate_key,
+            strategy_family,
+            official_reason,
+        )
     elif shadow_only:
         reason = "strategy_family_shadow_only"
         record_shadow_survival_gate_fill(
@@ -3015,8 +3320,8 @@ def simulate_paper_order(
             candidate_key,
             strategy_family,
         )
-    elif quote.get("execution_source") != "clob_book" or not quote.get("depth_sufficient"):
-        reason = "no_executable_clob_depth"
+    elif not official_allowed:
+        reason = official_reason
     else:
         position_cap = starting_cash * float(getattr(args, "max_position_pct", 0.02))
         city_cap_remaining = starting_cash * float(getattr(args, "max_city_date_pct", 0.10)) - city_date_exposure(db, account_id, city, target_date)
@@ -3920,7 +4225,89 @@ def build_label_attempt(
         "reason": reason,
         "provenance_json": bounded_json(provenance, RAW_JSON_LIMIT),
         "raw_excerpt": compact_text((source_record.data if source_record else provenance), RAW_EXCERPT_LIMIT),
+        "_source_record": source_record,
     }
+
+
+def enabled_label_source_specs(args: argparse.Namespace) -> list[tuple[str, str]]:
+    specs: list[tuple[str, str]] = []
+    if getattr(args, "enable_ncei", False):
+        specs.append(("noaa_ncei", "ncei_daily_labels"))
+    if getattr(args, "enable_nws", False):
+        specs.append(("nws", "nws"))
+    if getattr(args, "enable_iem", False):
+        specs.append(("iem_metar", "iem_metar"))
+    if getattr(args, "enable_metar_direct", False):
+        specs.append(("aviationweather_metar", "metar_direct"))
+    if getattr(args, "enable_meteostat", False):
+        specs.append(("meteostat", "meteostat"))
+    return specs
+
+
+def skipped_label_attempts_for_enabled_sources(
+    candidate: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    attempted_at: str,
+    reason: str,
+    bucket: BucketSpec | None = None,
+) -> list[dict[str, Any]]:
+    specs = enabled_label_source_specs(args) or [("labeler", "labeler")]
+    return [
+        build_label_attempt(
+            candidate,
+            attempted_at=attempted_at,
+            source_record=None,
+            source_provider=provider,
+            source_family=family,
+            source_status=reason,
+            outcome_status=SKIPPED_LABEL_STATUS,
+            reason=reason,
+            bucket=bucket,
+        )
+        for provider, family in specs
+    ]
+
+
+def record_source_snapshot_from_label_attempt(
+    db: sqlite3.Connection,
+    *,
+    candidate: dict[str, Any],
+    attempt: dict[str, Any],
+    run_id: int | None = None,
+) -> int:
+    """Persist one public-source observation snapshot for a label attempt.
+
+    This is intentionally write-only evidence capture: success, error, pending,
+    and skipped adapter outcomes all become snapshot rows so downstream source
+    delta logic can distinguish missing data from silent adapter omission.
+    """
+    record = attempt.get("_source_record")
+    provider = str(attempt.get("source_provider") or getattr(record, "provider", None) or "unknown")
+    family = str(attempt.get("source_family") or getattr(record, "family", None) or "labeler")
+    status = str(attempt.get("source_status") or getattr(record, "status", None) or "skipped")
+    outcome_status = str(attempt.get("outcome_status") or "")
+    data = getattr(record, "data", None) if record is not None else None
+    data = data if isinstance(data, dict) else {}
+    return record_source_observation_snapshot(
+        db,
+        run_id=run_id,
+        market_id=attempt.get("market_id") or candidate.get("market_id"),
+        event_key=candidate.get("event_key") or attempt.get("market_id") or candidate.get("market_id"),
+        source_record=record,
+        provider=provider,
+        family=family,
+        status=status,
+        station_id=attempt.get("station_id") or candidate.get("station_id"),
+        observed_at=data.get("observed_at") or data.get("obs_time_utc") or attempt.get("attempted_at"),
+        fetched_at=getattr(record, "fetched_at", None) if record is not None else attempt.get("attempted_at"),
+        local_date=data.get("local_date") or attempt.get("target_date") or candidate.get("target_date"),
+        observed_high_f=attempt.get("final_high_f") if outcome_status in {FINAL_LABEL_STATUS, PROVISIONAL_LABEL_STATUS} else data.get("daily_high_f", data.get("high_so_far_f")),
+        source_url=attempt.get("source_url"),
+        raw_excerpt=attempt.get("raw_excerpt"),
+        error=attempt.get("reason") if outcome_status in {ERROR_LABEL_STATUS, SKIPPED_LABEL_STATUS} or status not in {"ok", "success"} else None,
+        now=str(attempt.get("attempted_at") or utc_now_iso()),
+    )
 
 
 def insert_label_attempt(db: sqlite3.Connection, attempt: dict[str, Any]) -> int:
@@ -4025,6 +4412,7 @@ def apply_final_label_to_training_rows(
         now=str(attempt.get("attempted_at") or utc_now_iso()),
         label_attempt_id=attempt_id,
     )
+    refresh_station_residuals(db, now=str(attempt.get("attempted_at") or utc_now_iso()))
     return len(row_ids)
 
 
@@ -4049,6 +4437,7 @@ def label_candidate_groups(
           tr.station_source,
           tr.source_confidence,
           tr.market_family,
+          tr.event_key,
           min(la.attempted_at) as first_attempt,
           max(la.attempted_at) as latest_attempt
         from training_rows tr
@@ -4081,8 +4470,9 @@ def label_candidate_groups(
             "station_source": row[7],
             "source_confidence": row[8],
             "market_family": row[9],
-            "first_attempt": row[10],
-            "latest_attempt": row[11],
+            "event_key": row[10],
+            "first_attempt": row[11],
+            "latest_attempt": row[12],
             "position_id": None,
         }
         for row in rows
@@ -4092,32 +4482,9 @@ def label_candidate_groups(
 def attempt_delayed_label(candidate: dict[str, Any], args: argparse.Namespace, attempted_at: str) -> list[dict[str, Any]]:
     label_value, bucket, bucket_reason = determine_label_value(0.0, candidate.get("title"), candidate.get("outcome"))
     if bucket is None:
-        return [
-            build_label_attempt(
-                candidate,
-                attempted_at=attempted_at,
-                source_record=None,
-                source_provider="labeler",
-                source_family="labeler",
-                source_status=SKIPPED_LABEL_STATUS,
-                outcome_status=SKIPPED_LABEL_STATUS,
-                reason=bucket_reason,
-            )
-        ]
+        return skipped_label_attempts_for_enabled_sources(candidate, args, attempted_at=attempted_at, reason="parse_error")
     if not candidate.get("station_id"):
-        return [
-            build_label_attempt(
-                candidate,
-                attempted_at=attempted_at,
-                source_record=None,
-                source_provider="labeler",
-                source_family="labeler",
-                source_status=SKIPPED_LABEL_STATUS,
-                outcome_status=SKIPPED_LABEL_STATUS,
-                reason="missing_station_id",
-                bucket=bucket,
-            )
-        ]
+        return skipped_label_attempts_for_enabled_sources(candidate, args, attempted_at=attempted_at, reason="no_station_id", bucket=bucket)
 
     attempts: list[dict[str, Any]] = []
     timeout = float(getattr(args, "http_timeout", weather_sources.DEFAULT_TIMEOUT_SECONDS))
@@ -4130,7 +4497,7 @@ def attempt_delayed_label(candidate: dict[str, Any], args: argparse.Namespace, a
             if high is not None:
                 final_value, final_bucket, reason = determine_label_value(float(high), candidate.get("title"), candidate.get("outcome"))
                 if final_value is not None and final_bucket is not None:
-                    return [
+                    attempts.append(
                         build_label_attempt(
                             candidate,
                             attempted_at=attempted_at,
@@ -4145,7 +4512,8 @@ def attempt_delayed_label(candidate: dict[str, Any], args: argparse.Namespace, a
                             bucket=final_bucket,
                             station_id=station_identifier,
                         )
-                    ]
+                    )
+                    break
             attempts.append(
                 build_label_attempt(
                     candidate,
@@ -4182,9 +4550,8 @@ def attempt_delayed_label(candidate: dict[str, Any], args: argparse.Namespace, a
                         final_high_f=float(high),
                         label_value=provisional_value,
                         bucket=provisional_bucket,
-                    )
+                        )
                 )
-                return attempts
         else:
             attempts.append(
                 build_label_attempt(
@@ -4220,9 +4587,8 @@ def attempt_delayed_label(candidate: dict[str, Any], args: argparse.Namespace, a
                         final_high_f=float(high),
                         label_value=provisional_value,
                         bucket=provisional_bucket,
-                    )
+                        )
                 )
-                return attempts
         else:
             attempts.append(
                 build_label_attempt(
@@ -4237,6 +4603,41 @@ def attempt_delayed_label(candidate: dict[str, Any], args: argparse.Namespace, a
                     bucket=bucket,
                 )
             )
+
+    if getattr(args, "enable_metar_direct", False):
+        adapter = weather_sources.AviationWeatherMetarAdapter(enabled=True, timeout_seconds=timeout, cache_ttl_seconds=ttl)
+        record = adapter.fetch_current(str(candidate.get("station_id")))
+        attempts.append(
+            build_label_attempt(
+                candidate,
+                attempted_at=attempted_at,
+                source_record=record,
+                source_provider=record.provider,
+                source_family=record.family,
+                source_status=record.status,
+                outcome_status=ERROR_LABEL_STATUS if record.status == "error" else PENDING_LABEL_STATUS,
+                reason=record.error or "current_metar_not_final_daily_label",
+                bucket=bucket,
+            )
+        )
+
+    if getattr(args, "enable_meteostat", False):
+        adapter = weather_sources.MeteostatAdapter(enabled=True, timeout_seconds=timeout, cache_ttl_seconds=ttl)
+        record = adapter.historical_stub(str(candidate.get("station_id")), str(candidate.get("target_date")), str(candidate.get("target_date")))
+        skipped_statuses = {"dependency_absent", "adapter_stub", "disabled"}
+        attempts.append(
+            build_label_attempt(
+                candidate,
+                attempted_at=attempted_at,
+                source_record=record,
+                source_provider=record.provider,
+                source_family=record.family,
+                source_status=record.status,
+                outcome_status=SKIPPED_LABEL_STATUS if record.status in skipped_statuses else PENDING_LABEL_STATUS,
+                reason=record.error or record.status or "meteostat_unavailable",
+                bucket=bucket,
+            )
+        )
 
     if attempts:
         return attempts
@@ -4402,6 +4803,7 @@ def label(args: argparse.Namespace) -> None:
             if args.dry_run:
                 continue
             attempt_id = insert_label_attempt(db, attempt)
+            record_source_snapshot_from_label_attempt(db, candidate=candidate, attempt=attempt)
             attempts_written += 1
             if status == FINAL_LABEL_STATUS:
                 final_rows += apply_final_label_to_training_rows(db, candidate, attempt, attempt_id)
@@ -4514,14 +4916,20 @@ def evaluate(args: argparse.Namespace) -> None:
         )
 
 
+def table_exists(db: sqlite3.Connection, table: str) -> bool:
+    return bool(db.execute("select 1 from sqlite_master where type='table' and name=?", (table,)).fetchone())
+
+
 def table_count(db: sqlite3.Connection, table: str) -> int:
+    if not table_exists(db, table):
+        return 0
     row = db.execute(f"select count(*) from {table}").fetchone()
     return int(row[0] or 0)
 
 
 def health(args: argparse.Namespace) -> None:
     ensure_paper_only_guard(args)
-    db = init_db(args.db)
+    db = connect_sqlite(args.db, readonly=True) if os.path.exists(args.db) else init_db(args.db)
     metrics = portfolio_metrics(db)
     counts = {
         "runs": table_count(db, "runs"),
@@ -4824,6 +5232,10 @@ def build_parser() -> argparse.ArgumentParser:
     lb.add_argument("--disable-nws", dest="enable_nws", action="store_false", help="Disable NWS provisional label attempts")
     lb.add_argument("--enable-iem", dest="enable_iem", action="store_true", default=env_bool("ENABLE_IEM", False), help="Use IEM/ASOS daily highs as provisional supporting evidence")
     lb.add_argument("--disable-iem", dest="enable_iem", action="store_false", help="Disable IEM/ASOS provisional label attempts")
+    lb.add_argument("--enable-metar-direct", dest="enable_metar_direct", action="store_true", default=env_bool("ENABLE_METAR_DIRECT", False), help="Use AviationWeather current METAR as non-final diagnostic evidence")
+    lb.add_argument("--disable-metar-direct", dest="enable_metar_direct", action="store_false", help="Disable AviationWeather current METAR diagnostics")
+    lb.add_argument("--enable-meteostat", dest="enable_meteostat", action="store_true", default=env_bool("ENABLE_METEOSTAT", False), help="Record Meteostat optional-backfill diagnostics when available")
+    lb.add_argument("--disable-meteostat", dest="enable_meteostat", action="store_false", help="Disable Meteostat optional-backfill diagnostics")
     lb.add_argument("--dry-run", action="store_true", help="Find candidates and sources without writing labels, attempts, settlements, or snapshots")
     lb.add_argument("--no-settle", action="store_true", help="Do not settle paper positions after writing final labels")
     lb.set_defaults(func=label)

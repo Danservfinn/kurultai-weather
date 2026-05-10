@@ -18,6 +18,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(ROOT, "paper_weather.sqlite3")
 GOAL_PATH = os.path.join(ROOT, "goals", "paper_weather_edge_v1.yaml")
 RUNTIME_TUNABLES_PATH = os.path.join(ROOT, "runtime_tunables.env")
+SQLITE_BUSY_TIMEOUT_MS = 5000
 TUNING_ITERATIONS_PATH = os.path.join(ROOT, "tuning_iterations.jsonl")
 ITERATION_SCHEMA_VERSION = 1
 FINAL_LABEL_WHERE = "label_status='final' and label_value in (0, 1)"
@@ -645,7 +646,8 @@ def evaluate_tuning_state(
         performance_metrics = available_performance_metrics(None)
     else:
         uri = f"file:{os.path.abspath(db_path)}?mode=ro"
-        with sqlite3.connect(uri, uri=True) as db:
+        with sqlite3.connect(uri, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0, uri=True, isolation_level=None) as db:
+            db.execute(f"pragma busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             db.row_factory = sqlite3.Row
             training_rows = count_rows(db, "training_rows")
             labeled_rows = count_rows(db, "training_rows", FINAL_LABEL_WHERE)

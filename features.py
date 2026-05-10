@@ -11,10 +11,11 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-FEATURE_SCHEMA_VERSION = 2
+FEATURE_SCHEMA_VERSION = 3
 
 FEATURE_FAMILIES: dict[str, str] = {
     "settlement_source": "Settlement source/station confidence",
+    "settlement_source_delta": "Cross-source observation deltas and residual calibration readiness",
     "forecast_ensemble": "Forecast ensemble/spread/bias placeholders",
     "live_observation": "Live observation/touched/impossible state",
     "local_time": "Station-local day/time remaining",
@@ -375,6 +376,19 @@ def build_decision_features(
         "contract_payout_mapping_hash": stable_hash(market.get("payout_mapping_json") or market.get("payout_mapping")),
     }
 
+    source_delta_group = {
+        "source_delta_snapshot_count": market.get("source_delta_snapshot_count"),
+        "source_delta_provider_count": market.get("source_delta_provider_count"),
+        "source_delta_high_range_f": market.get("source_delta_high_range_f"),
+        "source_delta_abs_max_f": market.get("source_delta_abs_max_f"),
+        "source_delta_status": market.get("source_delta_status"),
+        "source_delta_primary_station_id": market.get("source_delta_primary_station_id"),
+        "station_residual_sample_count": market.get("station_residual_sample_count"),
+        "station_mean_residual_f": market.get("station_mean_residual_f"),
+        "station_residual_mae_f": market.get("station_residual_mae_f"),
+        "source_delta_shadow_only_flag": to_bool_int(market.get("strategy_family") == "settlement_source_delta"),
+    }
+
     source_statuses = [record.get("status") for record in source_records if record.get("status")]
     source_quality = {
         "source_fetch_status": observation.get("raw_status") or forecast.get("raw_status") or orderbook.get("raw_status"),
@@ -390,6 +404,7 @@ def build_decision_features(
 
     groups = {
         "settlement_source": settlement,
+        "settlement_source_delta": source_delta_group,
         "forecast_ensemble": forecast_group,
         "live_observation": live_observation,
         "local_time": time_group,

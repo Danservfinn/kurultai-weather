@@ -254,6 +254,8 @@ class WeatherEdgeTests(unittest.TestCase):
                 "depth": 10.0,
                 "depth_sufficient": True,
                 "raw_status": "ok",
+                "quote_age_seconds": 3.0,
+                "stale_book_flag": False,
             }
             scanner.simulate_paper_order(
                 db,
@@ -580,6 +582,8 @@ class WeatherEdgeTests(unittest.TestCase):
                 "depth": 10.0,
                 "depth_sufficient": True,
                 "raw_status": "ok",
+                "quote_age_seconds": 3.0,
+                "stale_book_flag": False,
             }
             scanner.simulate_paper_order(
                 db,
@@ -795,11 +799,72 @@ class WeatherEdgeTests(unittest.TestCase):
                 candidate_key="cand-dust",
                 strategy_family="ladder_inconsistency",
             )
-            self.assertEqual(db.execute("select status, reason from paper_orders").fetchone(), ("skipped", "entry_below_min_entry"))
+            self.assertEqual(db.execute("select status, reason from paper_orders").fetchone(), ("skipped", "below_min_entry_shadow_only"))
             self.assertEqual(db.execute("select count(*) from paper_fills").fetchone()[0], 0)
             self.assertEqual(db.execute("select count(*) from paper_positions").fetchone()[0], 0)
+            self.assertEqual(db.execute("select shadow_reason from shadow_orders").fetchone()[0], "below_min_entry_shadow_only")
             self.assertEqual(db.execute("select cash from paper_accounts where name=?", (scanner.DEFAULT_ACCOUNT_NAME,)).fetchone()[0], 1000.0)
             db.close()
+
+    def test_min_entry_blocks_dust_for_all_strategy_families(self):
+        families = [
+            "ladder_inconsistency",
+            "forecast_distribution_directional",
+            "latency_absorbing_state",
+            "settlement_source_delta",
+            "complement_arb",
+            "unknown",
+        ]
+        for family in families:
+            with self.subTest(family=family), tempfile.TemporaryDirectory() as td:
+                db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+                args = argparse.Namespace(
+                    disable_ledger=False,
+                    paper_size=5.0,
+                    min_fill_shares=1.0,
+                    min_entry=0.02,
+                    max_entry=0.95,
+                    max_spread=0.08,
+                    max_position_pct=0.50,
+                    max_city_date_pct=0.50,
+                    max_open_exposure_pct=0.50,
+                    allow_weak_families=True,
+                    disable_weak_families=False,
+                    strict_survival_gate=False,
+                    shadow_ladder_inconsistency=False,
+                    shadow_strategy_families="",
+                )
+                scanner.simulate_paper_order(
+                    db,
+                    args,
+                    run_id=1,
+                    signal_id=2,
+                    created_at="2026-05-09T00:00:00Z",
+                    m={"market_id": f"dust-{family}", "title": "Dust weather test"},
+                    outcome="Yes",
+                    token_id="tok-dust",
+                    city="New York",
+                    target_date="2026-05-09",
+                    signal_type="paper_buy_edge",
+                    quote={
+                        "entry_price": 0.001,
+                        "ask": 0.001,
+                        "spread": 0.001,
+                        "depth": 10000.0,
+                        "depth_sufficient": True,
+                        "execution_source": "clob_book",
+                        "quote_age_seconds": 1.0,
+                        "stale_book_flag": False,
+                        "raw_status": "ok",
+                    },
+                    event_key=f"event-dust-{family}",
+                    candidate_key=f"cand-dust-{family}",
+                    strategy_family=family,
+                )
+                self.assertEqual(db.execute("select count(*) from paper_fills").fetchone()[0], 0)
+                self.assertEqual(db.execute("select reason from paper_orders").fetchone()[0], "below_min_entry_shadow_only")
+                self.assertEqual(db.execute("select count(*) from shadow_fills").fetchone()[0], 1)
+                db.close()
 
     def test_ladder_inconsistency_shadow_mode_preserves_counterfactual_without_official_fill(self):
         with tempfile.TemporaryDirectory() as td:
@@ -844,8 +909,58 @@ class WeatherEdgeTests(unittest.TestCase):
             self.assertEqual(db.execute("select status, reason from paper_orders").fetchone(), ("skipped", "strategy_family_shadow_only"))
             self.assertEqual(db.execute("select count(*) from paper_fills").fetchone()[0], 0)
             self.assertEqual(db.execute("select count(*) from paper_positions").fetchone()[0], 0)
-            self.assertEqual(db.execute("select shadow_reason, strategy_family from shadow_orders").fetchone(), ("ladder_inconsistency_shadow_only", "ladder_inconsistency"))
+            self.assertEqual(db.execute("select shadow_reason, strategy_family from shadow_orders").fetchone(), ("ladder_shadow_until_labels", "ladder_inconsistency"))
             self.assertEqual(db.execute("select shares, price, cost, source from shadow_fills").fetchone(), (5.0, 0.40, 2.0, "clob_book"))
+            db.close()
+
+    def test_ladder_inconsistency_shadow_only_before_calibration_even_with_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+            args = argparse.Namespace(
+                disable_ledger=False,
+                paper_size=5.0,
+                min_fill_shares=1.0,
+                min_entry=0.02,
+                max_entry=0.95,
+                max_spread=0.08,
+                max_position_pct=0.50,
+                max_city_date_pct=0.50,
+                max_open_exposure_pct=0.50,
+                allow_weak_families=True,
+                disable_weak_families=False,
+                strict_survival_gate=False,
+                shadow_ladder_inconsistency=False,
+                shadow_strategy_families="",
+            )
+            scanner.simulate_paper_order(
+                db,
+                args,
+                run_id=1,
+                signal_id=2,
+                created_at="2026-05-09T00:00:00Z",
+                m={"market_id": "ladder-override", "title": "Ladder weather test"},
+                outcome="Yes",
+                token_id="tok-ladder",
+                city="New York",
+                target_date="2026-05-09",
+                signal_type="paper_buy_ladder",
+                quote={
+                    "entry_price": 0.40,
+                    "ask": 0.40,
+                    "spread": 0.01,
+                    "depth": 10.0,
+                    "depth_sufficient": True,
+                    "execution_source": "clob_book",
+                    "quote_age_seconds": 1.0,
+                    "stale_book_flag": False,
+                    "raw_status": "ok",
+                },
+                event_key="event-ladder-override",
+                candidate_key="cand-ladder-override",
+                strategy_family="ladder_inconsistency",
+            )
+            self.assertEqual(db.execute("select count(*) from paper_fills").fetchone()[0], 0)
+            self.assertEqual(db.execute("select shadow_reason from shadow_orders").fetchone()[0], "ladder_shadow_until_labels")
             db.close()
 
     def test_touch_watchlist_seed_activates_near_threshold_candidate(self):

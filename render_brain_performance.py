@@ -36,6 +36,7 @@ EVALUATION_MIN_ENTRY = 0.02
 EVALUATION_MAX_ENTRY = 0.95
 SNAPSHOT_SCHEMA_VERSION = 3
 POLL_INTERVAL_MS = int(float(os.environ.get("DASHBOARD_POLL_SECONDS", "30")) * 1000)
+SQLITE_BUSY_TIMEOUT_MS = 5000
 
 
 def clean_float(value: float, epsilon: float = 1e-9) -> float:
@@ -107,7 +108,9 @@ def tone_for(value: float, inverse: bool = False) -> str:
 
 
 def connect(db_path: str) -> sqlite3.Connection:
-    db = sqlite3.connect(db_path)
+    uri = f"file:{os.path.abspath(db_path)}?mode=ro"
+    db = sqlite3.connect(uri, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0, uri=True, isolation_level=None)
+    db.execute(f"pragma busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     db.row_factory = sqlite3.Row
     return db
 
@@ -151,6 +154,11 @@ def table_count(db: sqlite3.Connection, table: str) -> int:
         "contract_payouts",
         "lifecycle_attribution",
         "calibration_rows",
+        "shadow_orders",
+        "shadow_fills",
+        "source_observation_snapshots",
+        "settlement_source_registry",
+        "station_residuals",
     }
     if table not in allowed:
         raise ValueError(f"unexpected table name: {table}")
@@ -406,6 +414,7 @@ def labeling_progress(db: sqlite3.Connection) -> dict[str, Any]:
     return {
         "training_rows": training_rows,
         "labeled_rows": labeled_rows,
+        "eligible_rows": pending_rows,
         "pending_rows": pending_rows,
         "future_rows": future_rows,
         "open_positions": open_positions,
@@ -416,6 +425,113 @@ def labeling_progress(db: sqlite3.Connection) -> dict[str, Any]:
         "source_coverage": source_coverage,
         "recent_attempts": recent_attempts,
         "blockers": blockers,
+    }
+
+
+def source_adapter_status(db: sqlite3.Connection) -> dict[str, Any]:
+    if not table_exists(db, "source_observation_snapshots"):
+        return {"rows": 0, "by_status": [], "latest": []}
+    provider_expr = "coalesce(source_provider, provider, 'unknown')" if column_exists(db, "source_observation_snapshots", "source_provider") else "coalesce(provider, 'unknown')"
+    by_status = [
+        row_dict(row)
+        for row in db.execute(
+            f"""
+            select {provider_expr} as source_provider,
+                   coalesce(status, 'unknown') as status,
+                   count(*) as count,
+                   max(created_at) as latest_at
+            from source_observation_snapshots
+            group by {provider_expr}, coalesce(status, 'unknown')
+            order by source_provider, status
+            """
+        ).fetchall()
+    ]
+    latest = [
+        row_dict(row)
+        for row in db.execute(
+            f"""
+            select id, {provider_expr} as source_provider,
+                   coalesce(status, 'unknown') as status,
+                   family, station_id, observed_high_f, error, created_at
+            from source_observation_snapshots
+            order by id desc
+            limit 12
+            """
+        ).fetchall()
+    ]
+    return {"rows": table_count(db, "source_observation_snapshots"), "by_status": by_status, "latest": latest}
+
+
+def official_shadow_split(db: sqlite3.Connection) -> list[dict[str, Any]]:
+    families: dict[str, dict[str, Any]] = {}
+    if table_exists(db, "paper_orders"):
+        for row in db.execute("select coalesce(strategy_family, 'unknown') family, count(*) orders from paper_orders group by coalesce(strategy_family, 'unknown')"):
+            families.setdefault(str(row["family"]), {"strategy_family": row["family"], "official_orders": 0, "official_fills": 0, "shadow_orders": 0, "shadow_fills": 0})["official_orders"] = int(row["orders"] or 0)
+    if table_exists(db, "paper_fills"):
+        for row in db.execute("select coalesce(strategy_family, 'unknown') family, count(*) fills from paper_fills group by coalesce(strategy_family, 'unknown')"):
+            families.setdefault(str(row["family"]), {"strategy_family": row["family"], "official_orders": 0, "official_fills": 0, "shadow_orders": 0, "shadow_fills": 0})["official_fills"] = int(row["fills"] or 0)
+    if table_exists(db, "shadow_orders"):
+        for row in db.execute("select coalesce(strategy_family, 'unknown') family, count(*) orders from shadow_orders group by coalesce(strategy_family, 'unknown')"):
+            families.setdefault(str(row["family"]), {"strategy_family": row["family"], "official_orders": 0, "official_fills": 0, "shadow_orders": 0, "shadow_fills": 0})["shadow_orders"] = int(row["orders"] or 0)
+    if table_exists(db, "shadow_fills"):
+        for row in db.execute("select coalesce(strategy_family, 'unknown') family, count(*) fills from shadow_fills group by coalesce(strategy_family, 'unknown')"):
+            families.setdefault(str(row["family"]), {"strategy_family": row["family"], "official_orders": 0, "official_fills": 0, "shadow_orders": 0, "shadow_fills": 0})["shadow_fills"] = int(row["fills"] or 0)
+    return sorted(families.values(), key=lambda row: (-(row["official_fills"] + row["shadow_fills"]), str(row["strategy_family"])))
+
+
+def dust_contamination(db: sqlite3.Connection) -> dict[str, Any]:
+    if not table_exists(db, "paper_fills"):
+        return {"official_below_min_entry": 0, "post_fix_skipped_orders": 0, "shadow_below_min_entry": 0, "min_official_price": None}
+    row = db.execute(
+        "select count(*), min(price), max(filled_at) from paper_fills where price < ?",
+        (EVALUATION_MIN_ENTRY,),
+    ).fetchone()
+    skipped = 0
+    if table_exists(db, "paper_orders"):
+        skipped = int(
+            db.execute(
+                "select count(*) from paper_orders where status='skipped' and reason in ('below_min_entry_shadow_only', 'below_min_entry', 'entry_below_min_entry')"
+            ).fetchone()[0]
+            or 0
+        )
+    shadow = 0
+    if table_exists(db, "shadow_fills"):
+        shadow = int(db.execute("select count(*) from shadow_fills where price < ?", (EVALUATION_MIN_ENTRY,)).fetchone()[0] or 0)
+    min_price = db.execute("select min(price) from paper_fills").fetchone()[0]
+    return {
+        "official_below_min_entry": int(row[0] or 0),
+        "min_official_below_entry": float(row[1]) if row and row[1] is not None else None,
+        "latest_official_below_entry": row[2] if row else None,
+        "post_fix_skipped_orders": skipped,
+        "shadow_below_min_entry": shadow,
+        "min_official_price": float(min_price) if min_price is not None else None,
+    }
+
+
+def settlement_source_delta_status(db: sqlite3.Connection) -> dict[str, Any]:
+    labels = table_count(db, "label_attempts")
+    final_labels = 0
+    if table_exists(db, "label_attempts"):
+        final_labels = int(db.execute("select count(*) from label_attempts where outcome_status='final'").fetchone()[0] or 0)
+    calibration_rows = table_count(db, "calibration_rows")
+    official_rows = 0
+    if table_exists(db, "paper_fills"):
+        official_rows = int(db.execute("select count(*) from paper_fills where strategy_family='settlement_source_delta'").fetchone()[0] or 0)
+    shadow_orders = int(db.execute("select count(*) from shadow_orders where strategy_family='settlement_source_delta'").fetchone()[0] or 0) if table_exists(db, "shadow_orders") else 0
+    shadow_fills = int(db.execute("select count(*) from shadow_fills where strategy_family='settlement_source_delta'").fetchone()[0] or 0) if table_exists(db, "shadow_fills") else 0
+    locked = final_labels < 300 or calibration_rows < 300
+    return {
+        "label_attempts": labels,
+        "final_labels": final_labels,
+        "calibration_rows": calibration_rows,
+        "registry_rows": table_count(db, "settlement_source_registry"),
+        "source_snapshots": table_count(db, "source_observation_snapshots"),
+        "station_residuals": table_count(db, "station_residuals"),
+        "shadow_orders": shadow_orders,
+        "shadow_fills": shadow_fills,
+        "official_fills": official_rows,
+        "promotion_locked": locked,
+        "promotion_status": "locked" if locked else "unlocked_for_review",
     }
 
 
@@ -524,6 +640,8 @@ def research_metrics(db: sqlite3.Connection) -> dict[str, Any]:
     fill_realism = {
         "orders": table_count(db, "paper_orders"),
         "fills": table_count(db, "paper_fills"),
+        "shadow_orders": table_count(db, "shadow_orders"),
+        "shadow_fills": table_count(db, "shadow_fills"),
         "fill_rate": None,
         "clob_fills": 0,
         "displayed_price_fills": 0,
@@ -675,6 +793,10 @@ def research_metrics(db: sqlite3.Connection) -> dict[str, Any]:
         "rule_ambiguity_loss": rule_ambiguity_loss,
         "lifecycle_funnel": lifecycle_funnel,
         "event_exposure_latent_summary": event_exposure_latent_summary,
+        "official_shadow_split": official_shadow_split(db),
+        "dust_contamination": dust_contamination(db),
+        "source_adapter_status": source_adapter_status(db),
+        "settlement_source_delta": settlement_source_delta_status(db),
     }
 
 
@@ -712,6 +834,26 @@ def render_research_metrics_panel(metrics: dict[str, Any]) -> str:
         [escape(row.get("violation")), f'<span class="num">{escape(fmt_num(row.get("rows")))}</span>']
         for row in metrics.get("ladder_violations", [])
     ]
+    split_rows = [
+        [
+            escape(row.get("strategy_family")),
+            f'<span class="num">{escape(fmt_num(row.get("official_orders")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("official_fills")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("shadow_orders")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("shadow_fills")))}</span>',
+        ]
+        for row in metrics.get("official_shadow_split", [])
+    ]
+    source_status = metrics.get("source_adapter_status") or {}
+    source_rows = [
+        [
+            escape(row.get("source_provider")),
+            status_pill(row.get("status")),
+            f'<span class="num">{escape(fmt_num(row.get("count")))}</span>',
+            escape(row.get("latest_at") or "-"),
+        ]
+        for row in source_status.get("by_status", [])
+    ]
     event_rows = [
         [
             f'<span class="title-cell">{escape(row.get("city"))}</span><br><span class="muted">{escape(row.get("target_date"))} {escape(row.get("station_id"))}</span>',
@@ -726,6 +868,8 @@ def render_research_metrics_panel(metrics: dict[str, Any]) -> str:
     fill = metrics.get("fill_realism") or {}
     reaction = metrics.get("reaction_lag_stale_quote") or {}
     funnel = metrics.get("lifecycle_funnel") or {}
+    dust = metrics.get("dust_contamination") or {}
+    source_delta = metrics.get("settlement_source_delta") or {}
     delay = metrics.get("label_delay_histogram") or {}
     close = metrics.get("time_to_local_close") or {}
     return f"""
@@ -742,6 +886,7 @@ def render_research_metrics_panel(metrics: dict[str, Any]) -> str:
           <dl class="metric-list">
             <div><dt>Fill Rate</dt><dd>{escape(fmt_pct(fill.get("fill_rate")))}</dd></div>
             <div><dt>CLOB Fills</dt><dd>{escape(fmt_num(fill.get("clob_fills")))} / {escape(fmt_num(fill.get("fills")))}</dd></div>
+            <div><dt>Shadow Fills</dt><dd>{escape(fmt_num(fill.get("shadow_fills")))} from {escape(fmt_num(fill.get("shadow_orders")))} orders</dd></div>
             <div><dt>Avg Slippage</dt><dd>{escape(fmt_price(fill.get("avg_slippage")))}</dd></div>
             <div><dt>Depth Skips</dt><dd>{escape(fmt_num(fill.get("skipped_depth_orders")))}</dd></div>
           </dl>
@@ -751,6 +896,8 @@ def render_research_metrics_panel(metrics: dict[str, Any]) -> str:
           <dl class="metric-list">
             <div><dt>Quote Age</dt><dd>{escape(fmt_num(reaction.get("avg_quote_age_seconds"), 1))}s avg</dd></div>
             <div><dt>Stale Quotes</dt><dd>{escape(fmt_num(reaction.get("stale_quote_rows")))} / {escape(fmt_num(reaction.get("rows")))}</dd></div>
+            <div><dt>Dust Official</dt><dd>{escape(fmt_num(dust.get("official_below_min_entry")))} below {escape(fmt_price(EVALUATION_MIN_ENTRY))}</dd></div>
+            <div><dt>Dust Gate</dt><dd>{escape(fmt_num(dust.get("post_fix_skipped_orders")))} skipped, {escape(fmt_num(dust.get("shadow_below_min_entry")))} shadow</dd></div>
             <div><dt>Label Delay</dt><dd>{escape(json.dumps(delay, sort_keys=True))}</dd></div>
             <div><dt>Local Close</dt><dd>{escape(json.dumps(close, sort_keys=True))}</dd></div>
           </dl>
@@ -775,6 +922,20 @@ def render_research_metrics_panel(metrics: dict[str, Any]) -> str:
           <h3>Ladder Violations</h3>
           {render_table(["Violation", "Rows"], ladder_rows, "No ladder violations recorded.")}
         </div>
+      </div>
+      <div class="split">
+        <div>
+          <h3>Official vs Shadow</h3>
+          {render_table(["Strategy", "Official Orders", "Official Fills", "Shadow Orders", "Shadow Fills"], split_rows, "No official or shadow ledger rows yet.")}
+        </div>
+        <div>
+          <h3>Source Adapter Status</h3>
+          {render_table(["Source", "Status", "Rows", "Latest"], source_rows, "No source observation snapshots yet.")}
+        </div>
+      </div>
+      <div class="tuning-banner" aria-label="Settlement source delta promotion">
+        <strong>Settlement Source Delta: {escape(source_delta.get("promotion_status") or "locked")}</strong>
+        <span>registry {escape(fmt_num(source_delta.get("registry_rows")))}, snapshots {escape(fmt_num(source_delta.get("source_snapshots")))}, residuals {escape(fmt_num(source_delta.get("station_residuals")))}, shadow {escape(fmt_num(source_delta.get("shadow_fills")))}, official {escape(fmt_num(source_delta.get("official_fills")))}.</span>
       </div>
       <div class="table-section">
         <h3>Event Exposure and Latent Final High</h3>
@@ -1244,6 +1405,7 @@ def render_labeling_settlement_panel(progress: dict[str, Any]) -> str:
           <h3>Progress</h3>
           <dl class="metric-list">
             <div><dt>Labeled Rows</dt><dd>{escape(fmt_num(progress.get("labeled_rows")))} / {escape(fmt_num(progress.get("training_rows")))}</dd></div>
+            <div><dt>Eligible Rows</dt><dd>{escape(fmt_num(progress.get("eligible_rows")))}</dd></div>
             <div><dt>Pending Rows</dt><dd>{escape(fmt_num(progress.get("pending_rows")))}</dd></div>
             <div><dt>Future Rows</dt><dd>{escape(fmt_num(progress.get("future_rows")))}</dd></div>
             <div><dt>Attempts</dt><dd>{escape(fmt_num(progress.get("attempts")))}</dd></div>
@@ -1255,7 +1417,7 @@ def render_labeling_settlement_panel(progress: dict[str, Any]) -> str:
             <div><dt>Open Positions</dt><dd>{escape(fmt_num(progress.get("open_positions")))}</dd></div>
             <div><dt>Settled Positions</dt><dd>{escape(fmt_num(progress.get("settled_positions")))}</dd></div>
             <div><dt>Settlement Rows</dt><dd>{escape(fmt_num(progress.get("settlements")))}</dd></div>
-            <div><dt>Attempt Status</dt><dd>final {escape(fmt_num(status_counts.get("final", 0)))}, provisional {escape(fmt_num(status_counts.get("provisional", 0)))}, pending {escape(fmt_num(status_counts.get("pending", 0)))}</dd></div>
+            <div><dt>Attempt Status</dt><dd>final {escape(fmt_num(status_counts.get("final", 0)))}, provisional {escape(fmt_num(status_counts.get("provisional", 0)))}, pending {escape(fmt_num(status_counts.get("pending", 0)))}, skipped {escape(fmt_num(status_counts.get("skipped", 0)))}, error {escape(fmt_num(status_counts.get("error", 0)))}</dd></div>
           </dl>
         </div>
       </div>
@@ -1880,6 +2042,7 @@ def build_snapshot(
         "label attempts": table_count(db, "label_attempts"),
         "events": table_count(db, "events"),
         "calibration rows": table_count(db, "calibration_rows"),
+        "source snapshots": table_count(db, "source_observation_snapshots"),
     }
     expanded_counts = {
         "runs": table_count(db, "runs"),
@@ -1891,6 +2054,10 @@ def build_snapshot(
         "contract payouts": table_count(db, "contract_payouts"),
         "event snapshots": table_count(db, "event_exposure_snapshots"),
         "lifecycle rows": table_count(db, "lifecycle_attribution"),
+        "shadow orders": table_count(db, "shadow_orders"),
+        "shadow fills": table_count(db, "shadow_fills"),
+        "source registry": table_count(db, "settlement_source_registry"),
+        "station residuals": table_count(db, "station_residuals"),
     }
     paper_buy_count = db.execute(
         "select count(*) from signals where coalesce(signal_type, '') like 'paper_buy%'"
@@ -1993,6 +2160,15 @@ def build_snapshot(
         if progress["ready"]
         else f"Need {day_gap} more calendar days and {candidate_gap} more marked paper candidates."
     )
+    evidence_valid = int(label_progress.get("labeled_rows") or 0) > 0 and int(counts["calibration rows"] or 0) > 0
+    evidence_warning = ""
+    if not evidence_valid:
+        evidence_warning = f"""
+          <div class="tuning-banner" aria-label="Evidence validity warning">
+            <strong>Evidence not valid yet</strong>
+            <span>labels={escape(fmt_num(label_progress.get("labeled_rows")))}, calibration={escape(fmt_num(counts["calibration rows"]))}. Strategy survival is inconclusive; official paper PnL is not edge proof.</span>
+          </div>
+        """
 
     header_subhead = (
         f'Static performance tracker for the simulated {escape(fmt_money(metrics["starting_cash"]))} '
@@ -2007,6 +2183,7 @@ def build_snapshot(
         </div>
         {status_pill("paper-only")}
       </div>
+      {evidence_warning}
       <div class="progress-row">
         <strong>Calendar span</strong>
         {progress_bar(float(progress["sample_days"]), EVIDENCE_DAY_TARGET)}
