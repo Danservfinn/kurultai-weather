@@ -126,6 +126,18 @@ class ObservedHighLatencyTests(unittest.TestCase):
         self.assertEqual(db.execute("select count(*) from threshold_touch_events").fetchone()[0], 0)
         db.close()
 
+    def test_resilient_watcher_reports_sqlite_lock_instead_of_crashing(self) -> None:
+        path, db = temp_db()
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+        def locked_processor(*_args: object, **_kwargs: object) -> dict[str, int]:
+            raise sqlite3.OperationalError("database is locked")
+
+        stats = hot_state_watcher.process_once_resilient(db, processor=locked_processor)
+        db.close()
+        self.assertEqual(stats["sqlite_locked"], 1)
+        self.assertEqual(stats["watchlist"], 0)
+
     def test_threshold_touch_records_event(self) -> None:
         path, db = temp_db()
         self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))

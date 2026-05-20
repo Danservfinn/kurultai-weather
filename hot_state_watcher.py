@@ -244,6 +244,31 @@ def process_once(
     return stats
 
 
+def empty_stats(**overrides: int) -> dict[str, int]:
+    stats = {"watchlist": 0, "source_missing": 0, "touch_events": 0, "repricing_snapshots": 0, "signals_allowed": 0, "skipped": 0}
+    stats.update(overrides)
+    return stats
+
+
+def is_sqlite_locked_error(exc: sqlite3.OperationalError) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+def process_once_resilient(
+    db: sqlite3.Connection,
+    *,
+    min_edge: float = 0.04,
+    processor: Callable[..., dict[str, int]] = process_once,
+) -> dict[str, int]:
+    try:
+        return processor(db, min_edge=min_edge)
+    except sqlite3.OperationalError as exc:
+        if not is_sqlite_locked_error(exc):
+            raise
+        db.rollback()
+        return empty_stats(sqlite_locked=1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Paper-only hot observed-high threshold watcher.")
     parser.add_argument("--db", default=scanner.DB_PATH)
@@ -261,7 +286,7 @@ def main() -> None:
     db = scanner.init_db(args.db)
     try:
         while True:
-            stats = process_once(db, min_edge=args.min_edge)
+            stats = process_once_resilient(db, min_edge=args.min_edge)
             print(" ".join(f"{key}={value}" for key, value in stats.items()))
             if args.once:
                 break
