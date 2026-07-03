@@ -16,7 +16,10 @@ import os
 
 DEFAULT_DIRECTORY = "/Users/kublai/brain/projects"
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8765
+# 8765 is reserved by the authenticated Brain gateway on this host. Keep this
+# unauthenticated local artifact viewer on 8766 so the documented dashboard URL
+# works without HMAC headers while staying bound to localhost.
+DEFAULT_PORT = 8766
 
 
 class NoCacheHandler(http.server.SimpleHTTPRequestHandler):

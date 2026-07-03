@@ -16,6 +16,7 @@ import json
 import math
 import os
 import sqlite3
+import tempfile
 from collections.abc import Sequence
 from typing import Any
 
@@ -29,6 +30,7 @@ DB_PATH = os.path.join(ROOT, "paper_weather.sqlite3")
 DEFAULT_OUTPUT = "/Users/kublai/brain/projects/polymarket-weather-engine-performance.html"
 DEFAULT_JSON_OUTPUT = "/Users/kublai/brain/projects/polymarket-weather-engine-performance.json"
 DEFAULT_BANKROLL_USD = 1000.0
+DEFAULT_ACCOUNT_NAME = "default-paper"
 EVIDENCE_DAY_TARGET = 14
 EVIDENCE_CANDIDATE_TARGET = 300
 EVALUATION_EDGE_THRESHOLD = 0.08
@@ -37,6 +39,23 @@ EVALUATION_MAX_ENTRY = 0.95
 SNAPSHOT_SCHEMA_VERSION = 3
 POLL_INTERVAL_MS = int(float(os.environ.get("DASHBOARD_POLL_SECONDS", "30")) * 1000)
 SQLITE_BUSY_TIMEOUT_MS = 5000
+
+
+def runtime_tunable_env_value(key: str) -> str | None:
+    """Read a simple KEY=value from repo-local runtime_tunables.env without mutating os.environ."""
+    path = os.path.join(ROOT, "runtime_tunables.env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                if name.strip() == key:
+                    return value.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        return None
+    return None
 
 
 def clean_float(value: float, epsilon: float = 1e-9) -> float:
@@ -111,6 +130,11 @@ def connect(db_path: str) -> sqlite3.Connection:
     uri = f"file:{os.path.abspath(db_path)}?mode=ro"
     db = sqlite3.connect(uri, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0, uri=True, isolation_level=None)
     db.execute(f"pragma busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    # Keep renderer sort/group scratch space in memory. On the Mac mini the
+    # weather DB is multi-GB and APFS has periodically run near-full; allowing
+    # SQLite to spill read-only dashboard temp btrees to /var can make a render
+    # fail with "database or disk is full" even though no DB mutation is needed.
+    db.execute("pragma temp_store=memory")
     db.row_factory = sqlite3.Row
     return db
 
@@ -168,7 +192,227 @@ def table_count(db: sqlite3.Connection, table: str) -> int:
     return int(row[0] or 0)
 
 
+def dashboard_view_metrics(db: sqlite3.Connection) -> dict[str, Any]:
+    truth_tiers: dict[str, int] = {}
+    canonical_label_rows = 0
+    deduped_events = 0
+    if table_exists(db, "calibration_rows"):
+        tier_rows = db.execute(
+            """
+            select lower(coalesce(nullif(label_confidence, ''), nullif(label_source, ''), 'unknown')) as tier,
+                   count(*) as count
+            from calibration_rows
+            where label_value is not null
+            group by tier
+            order by count desc, tier
+            """
+        ).fetchall()
+        truth_tiers = {str(row["tier"]): int(row["count"] or 0) for row in tier_rows}
+        canonical_label_rows = int(sum(truth_tiers.values()))
+        dedupe_row = db.execute(
+            """
+            select count(distinct coalesce(nullif(event_key, ''), 'training:' || training_row_id)) as count
+            from calibration_rows
+            where label_value is not null
+            """
+        ).fetchone()
+        deduped_events = int(dedupe_row["count"] or 0) if dedupe_row else 0
+    legacy = {
+        "training_rows": table_count(db, "training_rows"),
+        "label_attempts": table_count(db, "label_attempts"),
+        "paper_fills": table_count(db, "paper_fills"),
+        "paper_settlements": table_count(db, "paper_settlements"),
+        "calibration_rows": table_count(db, "calibration_rows"),
+    }
+    clean_v2 = {
+        "canonical_label_rows": canonical_label_rows,
+        "deduped_events": deduped_events,
+        "truth_tiers": truth_tiers,
+        "proxy_consensus_rows": truth_tiers.get("multi_provider_proxy_consensus", 0),
+        "official_rows": sum(
+            count for tier, count in truth_tiers.items() if tier in {"official", "official_ncei", "ncei_official"}
+        ),
+    }
+    return {
+        "legacy": legacy,
+        "clean_v2": clean_v2,
+        "notes": [
+            "legacy retains all historical row counts for continuity",
+            "clean_v2 counts canonical calibration labels and deduplicates event_key for edge validation",
+        ],
+    }
+
+
+def operational_verdict(proxy_labeled_events: int, official_fills: int, shadow_fills: int) -> str:
+    if official_fills > 0 and proxy_labeled_events >= edge_validation.RESOLVED_TARGET:
+        return "UNDER_REVIEW"
+    if proxy_labeled_events > 0 and shadow_fills > 0:
+        return "SHADOW_ONLY"
+    if proxy_labeled_events > 0:
+        return "UNDER_REVIEW"
+    return "DISABLED"
+
+
+def shadow_proxy_leaderboard(db: sqlite3.Connection, limit: int = 10) -> dict[str, Any]:
+    if not table_exists(db, "calibration_rows"):
+        return {"rows": [], "notes": ["calibration_rows missing"]}
+    lab_sources = []
+    if table_exists(db, "training_rows"):
+        lab_sources.append("select coalesce(nullif(strategy_family, ''), 'unknown') as strategy_family from training_rows")
+    if table_exists(db, "strategy_candidates"):
+        lab_sources.append("select coalesce(nullif(strategy_family, ''), 'unknown') as strategy_family from strategy_candidates")
+    if not lab_sources:
+        lab_sources.append("select 'unknown' as strategy_family where 0")
+    lab_union_sql = " union all ".join(lab_sources)
+    shadow_sources = []
+    if table_exists(db, "shadow_fills"):
+        shadow_sources.append("select coalesce(nullif(strategy_family, ''), 'unknown') as strategy_family, cost, shares from shadow_fills")
+    if table_exists(db, "strategy_shadow_fills"):
+        shadow_sources.append("select coalesce(nullif(strategy_family, ''), 'unknown') as strategy_family, cost, shares from strategy_shadow_fills")
+    if not shadow_sources:
+        shadow_sources.append("select 'unknown' as strategy_family, 0.0 as cost, 0.0 as shares where 0")
+    shadow_union_sql = " union all ".join(shadow_sources)
+    rows = db.execute(
+        f"""
+        with proxy as (
+          select coalesce(nullif(strategy_family, ''), 'unknown') as strategy_family,
+                 count(*) as proxy_label_rows,
+                 count(distinct coalesce(nullif(event_key, ''), 'training:' || training_row_id)) as proxy_labeled_events,
+                 avg(prediction_prob) as mean_prediction_prob,
+                 avg(label_value) as hit_rate,
+                 avg(brier) as mean_brier,
+                 max(created_at) as latest_label_at
+          from calibration_rows
+          where label_value is not null
+            and lower(coalesce(nullif(label_confidence, ''), nullif(label_source, ''), '')) = 'multi_provider_proxy_consensus'
+          group by strategy_family
+        ),
+        training_families as (
+          select strategy_family,
+                 count(*) as strategy_lab_rows
+          from (
+            {lab_union_sql}
+          )
+          group by strategy_family
+        ),
+        shadow_union as (
+          {shadow_union_sql}
+        ),
+        shadow as (
+          select strategy_family,
+                 count(*) as shadow_fills,
+                 sum(cost) as shadow_cost,
+                 sum(shares) as shadow_shares
+          from shadow_union
+          group by strategy_family
+        ),
+        active_account as (
+          select id
+          from paper_accounts
+          where name = ?
+          limit 1
+        ),
+        official as (
+          select coalesce(nullif(po.strategy_family, ''), nullif(pf.strategy_family, ''), 'unknown') as strategy_family,
+                 count(*) as official_fills
+          from paper_fills pf
+          join paper_orders po on po.id = pf.order_id
+          join active_account aa on aa.id = po.account_id
+          where lower(coalesce(pf.source, '')) != 'shadow'
+          group by coalesce(nullif(po.strategy_family, ''), nullif(pf.strategy_family, ''), 'unknown')
+        ),
+        families as (
+          select strategy_family from proxy
+          union
+          select strategy_family from training_families
+          union
+          select strategy_family from shadow
+          union
+          select strategy_family from official
+        )
+        select families.strategy_family,
+               coalesce(proxy.proxy_label_rows, 0) as proxy_label_rows,
+               coalesce(proxy.proxy_labeled_events, 0) as proxy_labeled_events,
+               proxy.mean_prediction_prob,
+               proxy.hit_rate,
+               proxy.mean_brier,
+               proxy.latest_label_at,
+               coalesce(training_families.strategy_lab_rows, 0) as strategy_lab_rows,
+               coalesce(shadow.shadow_fills, 0) as shadow_fills,
+               coalesce(shadow.shadow_cost, 0.0) as shadow_cost,
+               coalesce(shadow.shadow_shares, 0.0) as shadow_shares,
+               coalesce(official.official_fills, 0) as official_fills
+        from families
+        left join proxy on proxy.strategy_family = families.strategy_family
+        left join training_families on training_families.strategy_family = families.strategy_family
+        left join shadow on shadow.strategy_family = families.strategy_family
+        left join official on official.strategy_family = families.strategy_family
+        order by proxy_labeled_events desc, mean_brier is null, mean_brier asc, families.strategy_family
+        limit ?
+        """,
+        (active_paper_account_name(), limit),
+    ).fetchall()
+    leaderboard_rows: list[dict[str, Any]] = []
+    for row in rows:
+        item = row_dict(row)
+        item["proxy_label_rows"] = int(item.get("proxy_label_rows") or 0)
+        item["proxy_labeled_events"] = int(item.get("proxy_labeled_events") or 0)
+        item["strategy_lab_rows"] = int(item.get("strategy_lab_rows") or 0)
+        item["shadow_fills"] = int(item.get("shadow_fills") or 0)
+        item["official_fills"] = int(item.get("official_fills") or 0)
+        item["evidence_status"] = "PROXY_CONSENSUS" if item["proxy_labeled_events"] > 0 else "NO_PROXY_EVIDENCE"
+        item["operational_verdict"] = operational_verdict(
+            item["proxy_labeled_events"], item["official_fills"], item["shadow_fills"]
+        )
+        leaderboard_rows.append(item)
+    return {
+        "rows": leaderboard_rows,
+        "notes": [
+            "proxy leaderboard includes strategy-lab families even when proxy evidence is absent",
+            "multi_provider_proxy_consensus labels are the only proxy evidence counted in proxy_labeled_events",
+            "official_fills are surfaced separately; shadow-only or no-proxy candidates are never marked operational",
+        ],
+    }
+
+
+def add_operational_verdicts_to_survival_rows(rows: list[dict[str, Any]], leaderboard: dict[str, Any]) -> list[dict[str, Any]]:
+    by_family = {row.get("strategy_family"): row for row in leaderboard.get("rows", [])}
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        family = item.get("strategy_family")
+        leader = by_family.get(family, {})
+        item["official_fills"] = int(leader.get("official_fills") or 0)
+        item["shadow_fills"] = int(leader.get("shadow_fills") or 0)
+        item["operational_verdict"] = operational_verdict(
+            int(item.get("resolved_events") or leader.get("proxy_labeled_events") or 0),
+            item["official_fills"],
+            item["shadow_fills"],
+        )
+        enriched.append(item)
+    return enriched
+
+
+def active_paper_account_name() -> str:
+    configured = os.environ.get("PAPER_ACCOUNT_NAME") or runtime_tunable_env_value("PAPER_ACCOUNT_NAME")
+    if configured and configured.strip():
+        return configured.strip()
+    return DEFAULT_ACCOUNT_NAME
+
+
 def latest_account(db: sqlite3.Connection) -> sqlite3.Row | None:
+    configured_name = active_paper_account_name()
+    row = db.execute(
+        """
+        select id, name, starting_cash, cash, realized_pnl, created_at, updated_at
+        from paper_accounts
+        where name=?
+        limit 1
+        """,
+        (configured_name,),
+    ).fetchone()
+    if row is not None:
+        return row
     return db.execute(
         """
         select id, name, starting_cash, cash, realized_pnl, created_at, updated_at
@@ -179,12 +423,108 @@ def latest_account(db: sqlite3.Connection) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def official_paper_status(db: sqlite3.Connection, account_id: int | None, account_name: str | None) -> dict[str, Any]:
+    status = {
+        "account_id": account_id,
+        "account_name": account_name or active_paper_account_name(),
+        "orders": 0,
+        "fills": 0,
+        "skipped": 0,
+        "skipped_reasons": {},
+        "idle": False,
+        "summary": "No active paper account found yet.",
+    }
+    if account_id is None or not table_exists(db, "paper_orders"):
+        return status
+    order_row = db.execute("select count(*) from paper_orders where account_id=?", (account_id,)).fetchone()
+    if table_exists(db, "paper_fills") and table_exists(db, "paper_orders"):
+        fill_row = db.execute(
+            """
+            select count(*)
+            from paper_fills pf
+            join paper_orders po on po.id = pf.order_id
+            where po.account_id=?
+            """,
+            (account_id,),
+        ).fetchone()
+    elif table_exists(db, "paper_fills") and column_exists(db, "paper_fills", "account_id"):
+        fill_row = db.execute("select count(*) from paper_fills where account_id=?", (account_id,)).fetchone()
+    else:
+        fill_row = None
+    skipped_row = db.execute("select count(*) from paper_orders where account_id=? and status='skipped'", (account_id,)).fetchone()
+    reason_rows = db.execute(
+        """
+        select coalesce(reason, 'unknown') reason, count(*) count
+        from paper_orders
+        where account_id=? and status='skipped'
+        group by coalesce(reason, 'unknown')
+        order by count desc, reason
+        """,
+        (account_id,),
+    ).fetchall()
+    skipped_reasons = {str(row["reason"]): int(row["count"] or 0) for row in reason_rows}
+    orders = int(order_row[0] or 0) if order_row else 0
+    fills = int(fill_row[0] or 0) if fill_row else 0
+    skipped = int(skipped_row[0] or 0) if skipped_row else 0
+    idle = orders > 0 and fills == 0
+    reasons = []
+    if skipped_reasons.get("below_min_entry_shadow_only"):
+        reasons.append("below min entry")
+    if skipped_reasons.get("strategy_family_shadow_only"):
+        reasons.append("shadow-only strategy families")
+    if skipped_reasons.get("strategy_family_survival_gate_disabled"):
+        reasons.append("survival gate disabled")
+    if idle and reasons:
+        summary = f"Clean account idle: {skipped} skipped official orders, dominated by {', '.join(reasons)}. Gates remain closed; no official fills were created."
+    elif idle:
+        summary = f"Clean account idle: {skipped} skipped official orders and no official fills."
+    elif fills > 0:
+        summary = f"Official paper ledger has {fills} simulated fills on the active account."
+    else:
+        summary = "Active paper account has no official orders yet."
+    status.update(
+        {
+            "orders": orders,
+            "fills": fills,
+            "skipped": skipped,
+            "skipped_reasons": skipped_reasons,
+            "idle": idle,
+            "summary": summary,
+        }
+    )
+    return status
+
+
+def render_official_paper_status_panel(status: dict[str, Any]) -> str:
+    reason_rows = [
+        [escape(reason.replace("_", " ")), f'<span class="num">{escape(fmt_num(count))}</span>']
+        for reason, count in status.get("skipped_reasons", {}).items()
+    ]
+    title = "Clean account idle" if status.get("idle") else "Official Paper Account"
+    return f"""
+      <div class="panel-header">
+        <div>
+          <h2>{escape(title)}</h2>
+          <p>{escape(status.get("summary"))}</p>
+        </div>
+        {status_pill("paper-only")}
+      </div>
+      <div class="grid stats">
+        {stat_card("Account", escape(status.get("account_name") or "-"), "Canonical official paper ledger", "neutral")}
+        {stat_card("Official Orders", fmt_num(status.get("orders")), "Orders on the active account", "neutral")}
+        {stat_card("Official Fills", fmt_num(status.get("fills")), "Still zero when gates block all candidates", "warning" if status.get("idle") else "neutral")}
+        {stat_card("Skipped", fmt_num(status.get("skipped")), "Gate-blocked official orders", "warning" if status.get("skipped") else "neutral")}
+      </div>
+      {render_table(["Skipped Reason", "Orders"], reason_rows, "No skipped official orders on the active account.")}
+    """
+
+
 def portfolio_metrics(db: sqlite3.Connection) -> dict[str, Any]:
     account = latest_account(db)
     if account is None:
         return {
             "account_id": None,
-            "account_name": "default-paper",
+            "account_name": active_paper_account_name(),
             "starting_cash": DEFAULT_BANKROLL_USD,
             "cash": DEFAULT_BANKROLL_USD,
             "open_exposure": 0.0,
@@ -309,30 +649,31 @@ def evaluation_progress(db: sqlite3.Connection) -> dict[str, Any]:
 
 def labeling_progress(db: sqlite3.Connection) -> dict[str, Any]:
     final_where = tuning_evaluator.FINAL_LABEL_WHERE
+    nonfinal_where = f"(label_status is null or not ({final_where}))"
     training_rows = table_count(db, "training_rows")
     labeled_rows = int(db.execute(f"select count(*) from training_rows where {final_where}").fetchone()[0] or 0)
     pending_rows = int(
         db.execute(
-            """
+            f"""
             select count(*)
             from training_rows
             where target_date is not null
               and target_date <> ''
               and target_date <= date('now')
-              and coalesce(label_status,'') <> 'final'
+              and {nonfinal_where}
             """
         ).fetchone()[0]
         or 0
     )
     future_rows = int(
         db.execute(
-            """
+            f"""
             select count(*)
             from training_rows
             where target_date is not null
               and target_date <> ''
               and target_date > date('now')
-              and coalesce(label_status,'') <> 'final'
+              and {nonfinal_where}
             """
         ).fetchone()[0]
         or 0
@@ -464,18 +805,28 @@ def source_adapter_status(db: sqlite3.Connection) -> dict[str, Any]:
 
 def official_shadow_split(db: sqlite3.Connection) -> list[dict[str, Any]]:
     families: dict[str, dict[str, Any]] = {}
+
+    def family_row(family: Any) -> dict[str, Any]:
+        return families.setdefault(str(family), {"strategy_family": family, "official_orders": 0, "official_fills": 0, "shadow_orders": 0, "shadow_fills": 0})
+
     if table_exists(db, "paper_orders"):
         for row in db.execute("select coalesce(strategy_family, 'unknown') family, count(*) orders from paper_orders group by coalesce(strategy_family, 'unknown')"):
-            families.setdefault(str(row["family"]), {"strategy_family": row["family"], "official_orders": 0, "official_fills": 0, "shadow_orders": 0, "shadow_fills": 0})["official_orders"] = int(row["orders"] or 0)
+            family_row(row["family"])["official_orders"] = int(row["orders"] or 0)
     if table_exists(db, "paper_fills"):
         for row in db.execute("select coalesce(strategy_family, 'unknown') family, count(*) fills from paper_fills group by coalesce(strategy_family, 'unknown')"):
-            families.setdefault(str(row["family"]), {"strategy_family": row["family"], "official_orders": 0, "official_fills": 0, "shadow_orders": 0, "shadow_fills": 0})["official_fills"] = int(row["fills"] or 0)
+            family_row(row["family"])["official_fills"] = int(row["fills"] or 0)
     if table_exists(db, "shadow_orders"):
         for row in db.execute("select coalesce(strategy_family, 'unknown') family, count(*) orders from shadow_orders group by coalesce(strategy_family, 'unknown')"):
-            families.setdefault(str(row["family"]), {"strategy_family": row["family"], "official_orders": 0, "official_fills": 0, "shadow_orders": 0, "shadow_fills": 0})["shadow_orders"] = int(row["orders"] or 0)
+            family_row(row["family"])["shadow_orders"] += int(row["orders"] or 0)
+    if table_exists(db, "strategy_shadow_orders"):
+        for row in db.execute("select coalesce(strategy_family, 'unknown') family, count(*) orders from strategy_shadow_orders group by coalesce(strategy_family, 'unknown')"):
+            family_row(row["family"])["shadow_orders"] += int(row["orders"] or 0)
     if table_exists(db, "shadow_fills"):
         for row in db.execute("select coalesce(strategy_family, 'unknown') family, count(*) fills from shadow_fills group by coalesce(strategy_family, 'unknown')"):
-            families.setdefault(str(row["family"]), {"strategy_family": row["family"], "official_orders": 0, "official_fills": 0, "shadow_orders": 0, "shadow_fills": 0})["shadow_fills"] = int(row["fills"] or 0)
+            family_row(row["family"])["shadow_fills"] += int(row["fills"] or 0)
+    if table_exists(db, "strategy_shadow_fills"):
+        for row in db.execute("select coalesce(strategy_family, 'unknown') family, count(*) fills from strategy_shadow_fills group by coalesce(strategy_family, 'unknown')"):
+            family_row(row["family"])["shadow_fills"] += int(row["fills"] or 0)
     return sorted(families.values(), key=lambda row: (-(row["official_fills"] + row["shadow_fills"]), str(row["strategy_family"])))
 
 
@@ -610,32 +961,65 @@ def research_metrics(db: sqlite3.Connection) -> dict[str, Any]:
         ]
 
     edge_buckets: dict[str, dict[str, Any]] = {}
+    station_source_disagreement_map: dict[str, int] = {}
+    rule_ambiguity_map: dict[str, dict[str, Any]] = {}
+
+    # ------------------------------------------------------------------
+    # Consolidated single-pass scan of training_rows
+    #
+    # On the 6 GB live DB, each full-table scan takes ~14 s.  Previously
+    # edge_buckets, station_source_disagreement, and rule_ambiguity_loss
+    # each scanned the table separately (~42 s total).  We now read the
+    # union of columns they need in a single pass and aggregate in Python.
+    # ------------------------------------------------------------------
     if table_exists(db, "training_rows"):
-        rows = db.execute(
-            """
-            select edge, model_prob, label_value
-            from training_rows
-            where edge is not null
-            """
-        ).fetchall()
-        for edge, model_prob, label_value in rows:
-            bucket = _bucket_edge(edge)
-            item = edge_buckets.setdefault(bucket, {"bucket": bucket, "rows": 0, "labeled_rows": 0, "brier": 0.0, "log_loss": 0.0})
-            item["rows"] += 1
-            if model_prob is not None and label_value in (0, 1, 0.0, 1.0):
-                prob = max(1e-6, min(1.0 - 1e-6, float(model_prob)))
-                label = float(label_value)
-                item["labeled_rows"] += 1
-                item["brier"] += (prob - label) * (prob - label)
-                item["log_loss"] += -(label * math.log(prob) + (1.0 - label) * math.log(1.0 - prob))
-        for item in edge_buckets.values():
-            labeled = int(item["labeled_rows"] or 0)
-            if labeled:
-                item["brier"] = item["brier"] / labeled
-                item["log_loss"] = item["log_loss"] / labeled
-            else:
-                item["brier"] = None
-                item["log_loss"] = None
+        scan_cols = [c for c in (
+            "edge", "model_prob", "label_value",
+            "source_confidence", "eligibility_class",
+        ) if column_exists(db, "training_rows", c)]
+        if scan_cols:
+            proj = ", ".join(f'"{c}"' for c in scan_cols)
+            scan_rows = db.execute(f"select {proj} from training_rows").fetchall()
+            for srow in scan_rows:
+                edge = srow["edge"] if "edge" in scan_cols else None
+                model_prob = srow["model_prob"] if "model_prob" in scan_cols else None
+                label_value = srow["label_value"] if "label_value" in scan_cols else None
+                source_conf = srow["source_confidence"] if "source_confidence" in scan_cols else None
+                elig = srow["eligibility_class"] if "eligibility_class" in scan_cols else None
+
+                # edge_buckets
+                if edge is not None:
+                    bucket = _bucket_edge(edge)
+                    item = edge_buckets.setdefault(bucket, {"bucket": bucket, "rows": 0, "labeled_rows": 0, "brier": 0.0, "log_loss": 0.0})
+                    item["rows"] += 1
+                    if model_prob is not None and label_value in (0, 1, 0.0, 1.0):
+                        prob = max(1e-6, min(1.0 - 1e-6, float(model_prob)))
+                        label = float(label_value)
+                        item["labeled_rows"] += 1
+                        item["brier"] += (prob - label) * (prob - label)
+                        item["log_loss"] += -(label * math.log(prob) + (1.0 - label) * math.log(1.0 - prob))
+
+                # station_source_disagreement
+                sc_key = str(source_conf or "unknown")
+                ea_key = str(elig or "unknown")
+                ssd_key = f"{sc_key}\x1f{ea_key}"
+                station_source_disagreement_map[ssd_key] = station_source_disagreement_map.get(ssd_key, 0) + 1
+
+                # rule_ambiguity_loss
+                ra_item = rule_ambiguity_map.setdefault(ea_key, {"rows": 0, "brier_sum": 0.0, "brier_n": 0})
+                ra_item["rows"] += 1
+                if label_value in (0, 1, 0.0, 1.0) and model_prob is not None:
+                    ra_item["brier_sum"] += (float(model_prob) - float(label_value)) ** 2
+                    ra_item["brier_n"] += 1
+
+            for item in edge_buckets.values():
+                labeled = int(item["labeled_rows"] or 0)
+                if labeled:
+                    item["brier"] = item["brier"] / labeled
+                    item["log_loss"] = item["log_loss"] / labeled
+                else:
+                    item["brier"] = None
+                    item["log_loss"] = None
 
     fill_realism = {
         "orders": table_count(db, "paper_orders"),
@@ -666,10 +1050,10 @@ def research_metrics(db: sqlite3.Connection) -> dict[str, Any]:
     label_delay_histogram: dict[str, int] = {}
     if table_exists(db, "training_rows"):
         rows = db.execute(
-            """
+            f"""
             select target_date, labeled_at
             from training_rows
-            where target_date is not null and labeled_at is not null and label_status='final'
+            where target_date is not null and labeled_at is not null and {tuning_evaluator.FINAL_LABEL_WHERE}
             """
         ).fetchall()
         for target_date, labeled_at in rows:
@@ -709,26 +1093,37 @@ def research_metrics(db: sqlite3.Connection) -> dict[str, Any]:
             ).fetchall()
         ]
 
-    station_source_disagreement = []
-    if table_exists(db, "training_rows"):
-        station_source_disagreement = [
-            row_dict(row)
-            for row in db.execute(
-                """
-                select coalesce(source_confidence, 'unknown') as source_confidence,
-                       coalesce(eligibility_class, 'unknown') as eligibility_class,
-                       count(*) as rows
-                from training_rows
-                group by coalesce(source_confidence, 'unknown'), coalesce(eligibility_class, 'unknown')
-                order by rows desc
-                limit 12
-                """
-            ).fetchall()
-        ]
+    station_source_disagreement = [
+        {
+            "source_confidence": key.split("\x1f")[0],
+            "eligibility_class": key.split("\x1f")[1],
+            "rows": count,
+        }
+        for key, count in sorted(
+            station_source_disagreement_map.items(),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )[:12]
+    ]
 
     time_to_local_close: dict[str, int] = {}
+    time_to_local_close_sampled = False
     if table_exists(db, "training_rows") and column_exists(db, "training_rows", "features_json"):
-        for (features_json,) in db.execute("select features_json from training_rows where features_json is not null").fetchall():
+        training_total_for_close = table_count(db, "training_rows")
+        if training_total_for_close > 50000:
+            time_to_local_close_sampled = True
+            rows = db.execute(
+                """
+                select features_json
+                from training_rows
+                where features_json is not null
+                order by id desc
+                limit 25000
+                """
+            ).fetchall()
+        else:
+            rows = db.execute("select features_json from training_rows where features_json is not null").fetchall()
+        for (features_json,) in rows:
             try:
                 payload = json.loads(features_json or "{}")
             except json.JSONDecodeError:
@@ -736,21 +1131,18 @@ def research_metrics(db: sqlite3.Connection) -> dict[str, Any]:
             bucket = _close_bucket(payload.get("minutes_until_local_end_of_day"))
             time_to_local_close[bucket] = time_to_local_close.get(bucket, 0) + 1
 
-    rule_ambiguity_loss = []
-    if table_exists(db, "training_rows"):
-        rule_ambiguity_loss = [
-            row_dict(row)
-            for row in db.execute(
-                """
-                select coalesce(eligibility_class, 'unknown') as eligibility_class,
-                       count(*) as rows,
-                       avg(case when label_value in (0,1) and model_prob is not null then (model_prob - label_value) * (model_prob - label_value) end) as brier
-                from training_rows
-                group by coalesce(eligibility_class, 'unknown')
-                order by rows desc
-                """
-            ).fetchall()
-        ]
+    rule_ambiguity_loss = [
+        {
+            "eligibility_class": elig,
+            "rows": data["rows"],
+            "brier": (data["brier_sum"] / data["brier_n"]) if data["brier_n"] else None,
+        }
+        for elig, data in sorted(
+            rule_ambiguity_map.items(),
+            key=lambda kv: kv[1]["rows"],
+            reverse=True,
+        )
+    ]
 
     lifecycle_funnel = {
         "candidates": table_count(db, "lifecycle_attribution"),
@@ -790,6 +1182,7 @@ def research_metrics(db: sqlite3.Connection) -> dict[str, Any]:
         "ladder_violations": ladder_violations,
         "station_source_disagreement": station_source_disagreement,
         "time_to_local_close": time_to_local_close,
+        "time_to_local_close_sampled": time_to_local_close_sampled,
         "rule_ambiguity_loss": rule_ambiguity_loss,
         "lifecycle_funnel": lifecycle_funnel,
         "event_exposure_latent_summary": event_exposure_latent_summary,
@@ -1002,22 +1395,45 @@ def signal_mix(db: sqlite3.Connection) -> list[sqlite3.Row]:
 def latest_runs(db: sqlite3.Connection, limit: int = 8) -> list[sqlite3.Row]:
     return db.execute(
         """
+        with recent_runs as (
+          select id, started_at, markets_seen, signals_seen
+          from runs
+          order by id desc
+          limit ?
+        ),
+        paper_buy_counts as (
+          select s.run_id, count(*) as paper_buys
+          from signals s
+          join recent_runs rr on rr.id = s.run_id
+          where coalesce(s.signal_type, '') like 'paper_buy%'
+          group by s.run_id
+        ),
+        order_counts as (
+          select o.run_id, count(*) as orders
+          from paper_orders o
+          join recent_runs rr on rr.id = o.run_id
+          group by o.run_id
+        ),
+        fill_counts as (
+          select o.run_id, count(*) as fills
+          from paper_orders o
+          join recent_runs rr on rr.id = o.run_id
+          join paper_fills f on f.order_id=o.id
+          group by o.run_id
+        )
         select
           r.id,
           r.started_at,
           r.markets_seen,
           r.signals_seen,
-          (select count(*) from signals s where s.run_id=r.id and coalesce(s.signal_type, '') like 'paper_buy%') as paper_buys,
-          (select count(*) from paper_orders o where o.run_id=r.id) as orders,
-          (
-            select count(*)
-            from paper_orders o
-            join paper_fills f on f.order_id=o.id
-            where o.run_id=r.id
-          ) as fills
-        from runs r
+          coalesce(pbc.paper_buys, 0) as paper_buys,
+          coalesce(oc.orders, 0) as orders,
+          coalesce(fc.fills, 0) as fills
+        from recent_runs r
+        left join paper_buy_counts pbc on pbc.run_id = r.id
+        left join order_counts oc on oc.run_id = r.id
+        left join fill_counts fc on fc.run_id = r.id
         order by r.id desc
-        limit ?
         """,
         (limit,),
     ).fetchall()
@@ -1345,19 +1761,84 @@ def render_strategy_family_survival_panel(rows: list[dict[str, Any]]) -> str:
             f'<span class="num">{escape(fmt_pct(row.get("edge_decile_persistence")))}</span>',
             f'<span class="num">{escape(fmt_pct(row.get("execution_realism")))}</span>',
             f'<span class="num">{escape(fmt_pct(row.get("ambiguity_control")))}</span>',
+            status_pill(row.get("operational_verdict") or "DISABLED"),
         ])
     return f"""
       <div class="panel-header">
         <div>
           <h2>Strategy Family Survival</h2>
-          <p>Family-level paper edge validation: realized PnL, calibration advantage, edge-decile persistence, execution realism, and ambiguity control. Non-promoted families are disabled for new paper fills by default.</p>
+          <p>Family-level paper edge validation: realized PnL, calibration advantage, edge-decile persistence, execution realism, ambiguity control, and operational readiness. Non-promoted families are disabled for new paper fills by default.</p>
         </div>
         {status_pill("paper gate")}
       </div>
       <div class="grid stats compact">{summary_cards}</div>
-      {render_table(["Family", "Verdict", "Score", "Resolved", "Days", "PnL", "ROI", "Brier Δ", "Decile persistence", "Execution", "Ambiguity"], table_rows, "No strategy-family survival rows yet.")}
+      {render_table(["Family", "Verdict", "Score", "Resolved", "Days", "PnL", "ROI", "Brier Δ", "Decile persistence", "Execution", "Ambiguity", "Ops"], table_rows, "No strategy-family survival rows yet.")}
       <p class="muted">Promotion target: {edge_validation.RESOLVED_TARGET} resolved rows and {edge_validation.DAY_TARGET} sample days, positive realized PnL, positive model-vs-market Brier delta, persistent edge deciles, clean labels, and executable fills.</p>
     """
+
+
+def render_dashboard_views_panel(views: dict[str, Any]) -> str:
+    legacy = views.get("legacy") or {}
+    clean = views.get("clean_v2") or {}
+    tier_rows = [
+        [escape(tier), f'<span class="num">{escape(fmt_num(count))}</span>']
+        for tier, count in (clean.get("truth_tiers") or {}).items()
+    ]
+    return f"""
+      <div class="panel-header">
+        <div>
+          <h2>Dashboard Views</h2>
+          <p>Legacy counts are preserved for continuity while clean_v2 separates canonical, deduped event evidence from historical row totals.</p>
+        </div>
+        {status_pill("clean_v2")}
+      </div>
+      <div class="grid stats compact">
+        {stat_card("Legacy label attempts", fmt_num(legacy.get("label_attempts")), "Raw historical attempts", "neutral")}
+        {stat_card("Legacy paper fills", fmt_num(legacy.get("paper_fills")), "Official paper fills", "neutral")}
+        {stat_card("clean_v2 labels", fmt_num(clean.get("canonical_label_rows")), "Canonical calibration labels", "positive" if clean.get("canonical_label_rows") else "neutral")}
+        {stat_card("clean_v2 events", fmt_num(clean.get("deduped_events")), "Deduped event_key count", "positive" if clean.get("deduped_events") else "neutral")}
+      </div>
+      <div class="split">
+        <div>
+          <h3>Legacy Surface</h3>
+          {render_table(["Metric", "Rows"], [[escape(key), f'<span class="num">{escape(fmt_num(value))}</span>'] for key, value in legacy.items()], "No legacy rows.")}
+        </div>
+        <div>
+          <h3>clean_v2 Truth Tiers</h3>
+          {render_table(["Truth tier", "Rows"], tier_rows, "No canonical labels yet.")}
+        </div>
+      </div>
+    """
+
+
+def render_shadow_proxy_leaderboard_panel(leaderboard: dict[str, Any]) -> str:
+    rows = leaderboard.get("rows") or []
+    table_rows = [
+        [
+            f'<strong>{escape(row.get("strategy_family"))}</strong>',
+            status_pill(row.get("operational_verdict") or "DISABLED"),
+            status_pill(row.get("evidence_status") or "NO_PROXY_EVIDENCE"),
+            f'<span class="num">{escape(fmt_num(row.get("proxy_labeled_events")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("proxy_label_rows")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("shadow_fills")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("official_fills")))}</span>',
+            f'<span class="num">{escape(fmt_pct(row.get("hit_rate")))}</span>',
+            f'<span class="num">{escape(fmt_num(row.get("mean_brier"), 4))}</span>',
+            escape(row.get("latest_label_at") or "-"),
+        ]
+        for row in rows
+    ]
+    return f"""
+      <div class="panel-header">
+        <div>
+          <h2>Shadow Proxy Leaderboard</h2>
+          <p>Ranks strategy families using multi-provider proxy consensus labels and shadow fills. This is a research-only view; official fills remain separate.</p>
+        </div>
+        {status_pill("shadow only")}
+      </div>
+      {render_table(["Family", "Ops", "Evidence", "Proxy events", "Proxy labels", "Shadow fills", "Official fills", "Hit rate", "Brier", "Latest label"], table_rows, "No strategy-lab families or multi-provider proxy consensus labels yet.")}
+    """
+
 
 def render_labeling_settlement_panel(progress: dict[str, Any]) -> str:
     status_counts = progress.get("attempt_status_counts") or {}
@@ -2016,12 +2497,16 @@ def build_snapshot(
 ) -> dict[str, Any]:
     generated_at = utc_now_iso()
     metrics = portfolio_metrics(db)
+    paper_status = official_paper_status(db, metrics.get("account_id"), metrics.get("account_name"))
     progress = evaluation_progress(db)
     label_progress = labeling_progress(db)
     research = research_metrics(db)
     observed_high_latency = latency_metrics.aggregate_latency_metrics(db)
     tuning_state = tuning_evaluator.evaluate_tuning_state(db_path=db_path)
+    dashboard_views = dashboard_view_metrics(db)
+    shadow_leaderboard = shadow_proxy_leaderboard(db)
     survival_rows = edge_validation.evaluate_strategy_families(db_path=db_path, persist=False)
+    survival_rows = add_operational_verdicts_to_survival_rows(survival_rows, shadow_leaderboard)
     tuning_iterations = tuning_evaluator.load_tuning_iterations(iteration_log_path)
     if not tuning_iterations:
         tuning_iterations = [
@@ -2205,11 +2690,14 @@ def build_snapshot(
     fragments = {
         "header_subhead": header_subhead,
         "bankroll_stats": "".join(bankroll_stats),
+        "official_paper_status_panel": render_official_paper_status_panel(paper_status),
         "count_cards": "".join(count_cards),
         "evidence_progress": evidence_progress,
         "equity_chart": equity_svg(snapshot_rows, float(metrics["starting_cash"])),
         "labeling_settlement_panel": render_labeling_settlement_panel(label_progress),
         "research_metrics_panel": render_research_metrics_panel(research),
+        "dashboard_views_panel": render_dashboard_views_panel(dashboard_views),
+        "shadow_proxy_leaderboard_panel": render_shadow_proxy_leaderboard_panel(shadow_leaderboard),
         "observed_high_latency_panel": render_observed_high_latency_panel(observed_high_latency),
         "tuning_section": render_tuning_section(tuning_state, metrics, progress),
         "strategy_family_survival_panel": render_strategy_family_survival_panel(survival_rows),
@@ -2251,9 +2739,12 @@ def build_snapshot(
             "evaluation_max_entry": EVALUATION_MAX_ENTRY,
         },
         "metrics": dict(metrics),
+        "official_paper_status": paper_status,
         "progress": dict(progress),
         "labeling_settlement": dict(label_progress),
         "research_metrics": research,
+        "dashboard_views": dashboard_views,
+        "shadow_proxy_leaderboard": shadow_leaderboard,
         "observed_high_latency": observed_high_latency,
         "strategy_family_survival": {
             "rows": survival_rows,
@@ -2353,6 +2844,10 @@ def build_html_from_snapshot(snapshot: dict[str, Any]) -> str:
     {fragments["bankroll_stats"]}
   </section>
 
+  <section class="panel table-section" aria-label="Official paper account status" data-live-fragment="official_paper_status_panel">
+    {fragments["official_paper_status_panel"]}
+  </section>
+
   <section class="grid counts" aria-label="Core row counts" data-live-fragment="count_cards">
     {fragments["count_cards"]}
   </section>
@@ -2379,6 +2874,14 @@ def build_html_from_snapshot(snapshot: dict[str, Any]) -> str:
 
   <section class="panel table-section" aria-label="Research metrics" data-live-fragment="research_metrics_panel">
     {fragments["research_metrics_panel"]}
+  </section>
+
+  <section class="panel table-section" aria-label="Dashboard view split" data-live-fragment="dashboard_views_panel">
+    {fragments["dashboard_views_panel"]}
+  </section>
+
+  <section class="panel table-section" aria-label="Shadow proxy leaderboard" data-live-fragment="shadow_proxy_leaderboard_panel">
+    {fragments["shadow_proxy_leaderboard_panel"]}
   </section>
 
   <section class="panel table-section" aria-label="Observed-high latency half-life" data-live-fragment="observed_high_latency_panel">
@@ -2571,14 +3074,36 @@ def build_html(
     return build_html_from_snapshot(build_snapshot(db, db_path, json_filename))
 
 
-def write_json_snapshot(snapshot: dict[str, Any], output_path: str) -> str:
-    output_dir = os.path.dirname(os.path.abspath(output_path))
+def _atomic_write_text(output_path: str, content: str) -> str:
+    """Write text via same-directory temp file + replace so readers never see partial JSON/HTML."""
+    abs_path = os.path.abspath(output_path)
+    output_dir = os.path.dirname(abs_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(snapshot, f, indent=2, sort_keys=True)
-        f.write("\n")
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(abs_path)}.",
+        suffix=".tmp",
+        dir=output_dir or None,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, abs_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
     return output_path
+
+
+def write_json_snapshot(snapshot: dict[str, Any], output_path: str) -> str:
+    payload = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
+    return _atomic_write_text(output_path, payload)
 
 
 def render(
@@ -2593,11 +3118,7 @@ def render(
     with connect(db_path) as db:
         snapshot = build_snapshot(db, db_path, json_filename=json_filename, iteration_log_path=iteration_log_path)
         doc = build_html_from_snapshot(snapshot)
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(doc)
+    _atomic_write_text(output_path, doc)
     if json_output_path:
         write_json_snapshot(snapshot, json_output_path)
     return output_path, json_output_path

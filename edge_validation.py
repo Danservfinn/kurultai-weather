@@ -10,6 +10,8 @@ import sqlite3
 from collections import defaultdict
 from typing import Any
 
+import truth_tiers
+
 PROMOTE_PAPER_SIZE = "PROMOTE_PAPER_SIZE"
 CONTINUE_OBSERVING = "CONTINUE_OBSERVING"
 INCONCLUSIVE = "INCONCLUSIVE"
@@ -93,6 +95,130 @@ def read_all(db: sqlite3.Connection, table: str) -> list[sqlite3.Row]:
     return list(db.execute(f"select * from {table}"))
 
 
+def quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def read_columns(db: sqlite3.Connection, table: str, columns: list[str]) -> list[sqlite3.Row]:
+    """Read only the columns needed for survival scoring.
+
+    The live training table carries multi-GB feature JSON blobs.  Dashboard and
+    scan guard paths only need a compact scoring surface, so selecting ``*`` can
+    freeze renders or consume gigabytes of RAM.  Missing legacy columns are
+    intentionally skipped; the existing ``get_value`` helpers already supply
+    safe defaults for absent fields.
+    """
+    if not table_exists(db, table):
+        return []
+    available = table_columns(db, table)
+    selected = [column for column in columns if column in available]
+    if not selected:
+        return []
+    db.row_factory = sqlite3.Row
+    projection = ", ".join(quote_identifier(column) for column in selected)
+    return list(db.execute(f"select {projection} from {quote_identifier(table)}"))
+
+
+TRAINING_SURVIVAL_COLUMNS = [
+    "id",
+    "created_at",
+    "market_id",
+    "outcome",
+    "market_prob",
+    "model_prob",
+    "entry_price",
+    "edge",
+    "depth_sufficient",
+    "label_value",
+    "event_key",
+    "candidate_key",
+    "strategy_family",
+    "eligibility_class",
+    "source_confidence",
+    "settlement_state",
+    "label_status",
+    "quote_age_seconds",
+    "stale_book_flag",
+    "execution_source",
+]
+
+
+SIGNAL_SURVIVAL_COLUMNS = [
+    "id",
+    "strategy_family",
+    "quote_age_seconds",
+    "stale_book_flag",
+    "depth_sufficient",
+    "execution_source",
+]
+
+
+def table_columns(db: sqlite3.Connection, table: str) -> set[str]:
+    if not table_exists(db, table):
+        return set()
+    return {str(row[1]) for row in db.execute(f"pragma table_info({table})")}
+
+
+def normalized_provider_set(value: Any) -> list[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    if ":" in raw and raw.split(":", 1)[0] in {"consensus", "proxy_consensus"}:
+        raw = raw.split(":", 1)[1]
+    seen: dict[str, None] = {}
+    for piece in raw.split("+"):
+        provider = "_".join(piece.strip().lower().split())
+        if provider:
+            seen.setdefault(provider, None)
+    return list(seen)
+
+
+def has_clean_calibration_surface(db: sqlite3.Connection) -> bool:
+    calibration_required = {"training_row_id", "event_key", "target_metric", "label_attempt_id", "label_confidence", "provider_set", "label_value"}
+    attempt_required = {"id", "outcome_status", "target_metric", "final_observed_f", "label_value", "source_provider"}
+    return calibration_required.issubset(table_columns(db, "calibration_rows")) and attempt_required.issubset(table_columns(db, "label_attempts"))
+
+
+def clean_calibration_training_ids(db: sqlite3.Connection) -> set[int]:
+    if not has_clean_calibration_surface(db):
+        return set()
+    rows = db.execute(
+        """
+        select c.training_row_id,
+               c.event_key,
+               c.target_metric,
+               c.label_attempt_id,
+               c.label_confidence,
+               c.provider_set,
+               c.label_value,
+               la.outcome_status,
+               la.target_metric as attempt_target_metric,
+               la.final_observed_f,
+               la.label_value as attempt_label_value,
+               la.source_provider
+        from calibration_rows c
+        left join label_attempts la on la.id=c.label_attempt_id
+        where c.label_attempt_id is not null
+          and c.label_attempt_id != -1
+          and coalesce(c.event_key, '') != ''
+          and coalesce(c.target_metric, '') != ''
+          and coalesce(c.label_confidence, '') != ''
+          and coalesce(c.provider_set, '') != ''
+          and c.label_value in (0, 1)
+          and la.id is not null
+          and coalesce(la.target_metric, '') != ''
+          and la.final_observed_f is not null
+          and la.label_value in (0, 1)
+        """
+    ).fetchall()
+    clean: set[int] = set()
+    for row in rows:
+        tier = truth_tiers.tier_for_label(row["label_confidence"] or row["outcome_status"], row["provider_set"] or row["source_provider"])
+        if truth_tiers.is_clean_calibration_tier(tier):
+            clean.add(int(row["training_row_id"]))
+    return clean
+
+
 def ambiguous(row: sqlite3.Row | dict[str, Any]) -> bool:
     eligibility = str(get_value(row, "eligibility_class", default="") or "").lower()
     source_conf = str(get_value(row, "source_confidence", default="") or "").lower()
@@ -156,6 +282,43 @@ def count_orders(db: sqlite3.Connection) -> dict[str, dict[str, int]]:
         if str(row["status"] or "").lower() == "filled":
             out[family]["filled_orders"] += n
     return out
+
+
+def event_sample_key(row: sqlite3.Row | dict[str, Any]) -> str:
+    event_key = str(get_value(row, "event_key", default="") or "").strip()
+    if event_key:
+        return f"event:{event_key}"
+    candidate_key = str(get_value(row, "candidate_key", default="") or "").strip()
+    if candidate_key:
+        return f"candidate:{candidate_key}"
+    market_id = str(get_value(row, "market_id", default="") or "").strip()
+    outcome = str(get_value(row, "outcome", default="") or "").strip()
+    if market_id or outcome:
+        return f"market:{market_id}:{outcome}"
+    return f"row:{get_value(row, 'id', default='')}"
+
+
+def row_sort_token(row: sqlite3.Row | dict[str, Any]) -> tuple[str, int]:
+    created_at = str(get_value(row, "created_at", default="") or "")
+    row_id = int(get_value(row, "id", default=0) or 0)
+    return created_at, row_id
+
+
+def dedupe_event_samples(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    """Collapse repeated scanner rows so survival scoring is event-sample based.
+
+    The scanner can observe the same weather event on many runs. Survival
+    Brier/PnL/persistence/sample counts should not improve merely because a
+    duplicate scan row was inserted; keep the latest row per event_key with
+    candidate/market fallback for legacy rows without event metadata.
+    """
+    by_key: dict[str, sqlite3.Row] = {}
+    for row in rows:
+        key = event_sample_key(row)
+        existing = by_key.get(key)
+        if existing is None or row_sort_token(row) >= row_sort_token(existing):
+            by_key[key] = row
+    return sorted(by_key.values(), key=row_sort_token)
 
 
 def edge_deciles(rows: list[sqlite3.Row]) -> tuple[list[dict[str, Any]], float]:
@@ -234,8 +397,10 @@ def verdict_for(row: dict[str, Any]) -> str:
 
 def evaluate_strategy_families(db_path: str = DEFAULT_DB_PATH, *, persist: bool = False) -> list[dict[str, Any]]:
     db = connect_db(db_path, readonly=not persist)
-    training = read_all(db, "training_rows")
-    signals = read_all(db, "signals")
+    training = read_columns(db, "training_rows", TRAINING_SURVIVAL_COLUMNS)
+    signals = read_columns(db, "signals", SIGNAL_SURVIVAL_COLUMNS)
+    clean_label_ids = clean_calibration_training_ids(db)
+    require_clean_labels = has_clean_calibration_surface(db)
     fills_by_candidate = read_fills_by_candidate(db)
     fills_by_family = read_fills_by_family(db)
     order_counts = count_orders(db)
@@ -245,8 +410,15 @@ def evaluate_strategy_families(db_path: str = DEFAULT_DB_PATH, *, persist: bool 
     for family in families:
         family_training = [r for r in training if family_of(r) == family]
         family_signals = [r for r in signals if family_of(r) == family]
-        resolved_rows = [r for r in family_training if get_value(r, "label_value") is not None]
-        dates = {str(get_value(r, "created_at"))[:10] for r in family_training if get_value(r, "created_at")}
+        raw_resolved_rows = [r for r in family_training if get_value(r, "label_value") is not None]
+        raw_event_rows = dedupe_event_samples(raw_resolved_rows)
+        if require_clean_labels:
+            clean_scan_rows = [r for r in raw_resolved_rows if int(get_value(r, "id") or -1) in clean_label_ids]
+            resolved_rows = dedupe_event_samples(clean_scan_rows)
+        else:
+            resolved_rows = raw_event_rows
+        quarantined_label_count = max(0, len(raw_event_rows) - len(resolved_rows))
+        dates = {str(get_value(r, "created_at"))[:10] for r in resolved_rows if get_value(r, "created_at")}
         pnl, cost_basis, _ = compute_realized_from_fills(resolved_rows, fills_by_candidate)
         if not cost_basis and family in fills_by_family:
             cost_basis = sum(float(r["cost"] or 0.0) for r in fills_by_family[family])
@@ -281,6 +453,8 @@ def evaluate_strategy_families(db_path: str = DEFAULT_DB_PATH, *, persist: bool 
         roi = safe_div(pnl, cost_basis)
         row = {
             "strategy_family": family, "candidates": len(family_training), "signals": signal_count, "fills": fills,
+            "clean_label_count": len(resolved_rows),
+            "quarantined_label_count": quarantined_label_count,
             "resolved_count": len(resolved_rows), "sample_days": len(dates), "realized_pnl": pnl,
             "cost_basis": cost_basis, "roi": roi, "model_brier": model_brier, "market_brier": market_brier,
             "entry_price_brier_diagnostic": entry_price_brier_diagnostic,

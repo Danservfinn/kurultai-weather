@@ -10,6 +10,7 @@ sys.path.insert(0, ROOT)
 
 import scanner
 import tuning_evaluator
+import truth_tiers
 
 
 GOAL_TEXT = """name: paper_weather_edge_v1
@@ -34,6 +35,38 @@ allowed_tunables:
 
 
 class TuningEvaluatorTests(unittest.TestCase):
+    def test_final_label_where_counts_proxy_consensus_and_official_final_statuses(self):
+        statuses_sql = tuning_evaluator.FINAL_LABEL_STATUSES_SQL
+        for status in truth_tiers.FINAL_LABEL_OUTCOME_STATUSES:
+            self.assertIn(repr(status), statuses_sql)
+        self.assertIn("label_status in", tuning_evaluator.FINAL_LABEL_WHERE)
+        self.assertIn("label_value in (0, 1)", tuning_evaluator.FINAL_LABEL_WHERE)
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "paper.sqlite3")
+            db = scanner.init_db(db_path)
+            rows = [
+                ("final", 1.0),
+                ("final_official", 0.0),
+                ("final_proxy_consensus", 1.0),
+                ("multi_provider_proxy_consensus", 0.0),
+                ("single_provider_proxy", 1.0),
+                (None, None),
+            ]
+            for idx, (status, value) in enumerate(rows, start=1):
+                db.execute(
+                    """
+                    insert into training_rows(created_at, market_id, outcome, target_date, label_status, label_value)
+                    values(?,?,?,?,?,?)
+                    """,
+                    (f"2026-05-{idx:02d}T00:00:00+00:00", f"m{idx}", "Yes", f"2026-05-{idx:02d}", status, value),
+                )
+            db.commit()
+            labeled_rows = db.execute(f"select count(*) from training_rows where {tuning_evaluator.FINAL_LABEL_WHERE}").fetchone()[0]
+            db.close()
+
+        self.assertEqual(labeled_rows, 4)
+
     def test_post_label_paper_forward_gate_never_approves_live_trading(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = os.path.join(td, "paper.sqlite3")
@@ -143,6 +176,52 @@ class TuningEvaluatorTests(unittest.TestCase):
         self.assertFalse(values["enable_wu"])
         self.assertFalse(values["allow_paid_provider_features"])
         self.assertEqual(values["http_timeout_seconds"], 6)
+
+    def test_bounded_training_text_match_count_samples_large_feature_json_scans(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "paper.sqlite3")
+            db = scanner.init_db(db_path)
+            for index, payload in enumerate(
+                (
+                    '{"source_quality_score": 1}',
+                    '{"safe": true}',
+                    '{"label_value": 1}',
+                ),
+                start=1,
+            ):
+                db.execute(
+                    """
+                    insert into training_rows(
+                      created_at, run_id, signal_id, market_id, title, outcome, token_id,
+                      city, target_date, features_json
+                    ) values(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        f"2026-05-0{index}T12:00:00+00:00",
+                        index,
+                        index,
+                        f"m{index}",
+                        "Denver high temperature",
+                        "80F+",
+                        f"t{index}",
+                        "Denver",
+                        f"2026-05-0{index}",
+                        payload,
+                    ),
+                )
+            db.commit()
+
+            count, sampled = tuning_evaluator.bounded_training_text_match_count(
+                db,
+                "coalesce(features_json,'') like '%label_value%'",
+                total_rows=3,
+                exact_row_limit=1,
+                sample_rows=2,
+            )
+            db.close()
+
+            self.assertTrue(sampled)
+            self.assertEqual(count, 1)
 
     def test_iteration_jsonl_records_insufficient_data_and_sanitizes_unsafe_rows(self):
         with tempfile.TemporaryDirectory() as td:

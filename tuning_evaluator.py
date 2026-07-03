@@ -12,6 +12,7 @@ import sqlite3
 from typing import Any
 
 import features
+import truth_tiers
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -21,7 +22,8 @@ RUNTIME_TUNABLES_PATH = os.path.join(ROOT, "runtime_tunables.env")
 SQLITE_BUSY_TIMEOUT_MS = 5000
 TUNING_ITERATIONS_PATH = os.path.join(ROOT, "tuning_iterations.jsonl")
 ITERATION_SCHEMA_VERSION = 1
-FINAL_LABEL_WHERE = "label_status='final' and label_value in (0, 1)"
+FINAL_LABEL_STATUSES_SQL = ", ".join(repr(status) for status in sorted(truth_tiers.FINAL_LABEL_OUTCOME_STATUSES))
+FINAL_LABEL_WHERE = f"label_status in ({FINAL_LABEL_STATUSES_SQL}) and label_value in (0, 1)"
 
 
 TUNABLE_ENV_NAMES = {
@@ -349,30 +351,109 @@ def sql_count_if(db: sqlite3.Connection, table: str, condition: str) -> int:
     return count_rows(db, table, condition)
 
 
+def bounded_training_text_match_count(
+    db: sqlite3.Connection,
+    condition: str,
+    *,
+    total_rows: int,
+    exact_row_limit: int = 50000,
+    sample_rows: int = 5000,
+) -> tuple[int, bool]:
+    """Count expensive feature-json text predicates without freezing live renders.
+
+    The live paper DB is multi-GB because ``features_json`` preserves durable
+    decision-time training evidence. Full-table ``LIKE '%needle%'`` scans over
+    that blob column can make the public dashboard renderer exceed its cron
+    budget. Small/test DBs still use exact counts; large live DBs use a latest-row
+    sample for anomaly detection and mark the result as sampled.
+    """
+
+    if total_rows <= exact_row_limit:
+        return count_rows(db, "training_rows", condition), False
+    limited = db.execute(
+        f"""
+        select count(*)
+        from (
+            select features_json
+            from training_rows
+            where features_json is not null
+            order by id desc
+            limit {int(sample_rows)}
+        )
+        where {condition}
+        """
+    ).fetchone()[0]
+    return int(limited or 0), True
+
+
 def feature_family_coverage(db: sqlite3.Connection | None) -> list[dict[str, Any]]:
     if db is None or not table_exists(db, "training_rows"):
         total = 0
+        training_coverage = {
+            "settlement_source": 0,
+            "forecast_ensemble": 0,
+            "live_observation": 0,
+            "local_time": 0,
+            "microstructure": 0,
+            "source_confidence": 0,
+        }
     else:
         total = count_rows(db, "training_rows")
+        def present(column: str) -> str:
+            return f"{column} is not null" if column_exists(db, "training_rows", column) else "0"
+
+        # Keep live dashboard/tuning renders bounded: the production DB now has
+        # hundreds of thousands of durable training rows, and separate full-table
+        # counts for each feature family made the renderer exceed cron budgets.
+        # One aggregate scan preserves exact counts without mutating SQLite.
+        row = db.execute(
+            f"""
+            select
+              sum(case when {present('station_id')} or {present('source_url')} or {present('source_confidence')} then 1 else 0 end) as settlement_source,
+              sum(case when {present('forecast_snapshot_id')} or {present('model_prob')} then 1 else 0 end) as forecast_ensemble,
+              sum(case when {present('observation_id')} or {present('bucket_state')} then 1 else 0 end) as live_observation,
+              sum(case when {present('target_date')} and {present('created_at')} then 1 else 0 end) as local_time,
+              sum(case when {present('orderbook_snapshot_id')} or {present('entry_price')} or {present('spread')} or {present('depth')} then 1 else 0 end) as microstructure,
+              sum(case when {present('source_confidence')} then 1 else 0 end) as source_confidence
+            from training_rows
+            """
+        ).fetchone()
+        training_coverage = {
+            key: int((row[key] if row is not None else 0) or 0)
+            for key in (
+                "settlement_source",
+                "forecast_ensemble",
+                "live_observation",
+                "local_time",
+                "microstructure",
+                "source_confidence",
+            )
+        }
     signal_rows = count_rows(db, "signals") if db is not None else 0
     snapshot_rows = count_rows(db, "paper_account_snapshots") if db is not None else 0
     leakage_rows = 0
+    leakage_sampled = False
+    feature_json_quality_rows = 0
+    feature_json_quality_sampled = False
     if db is not None and table_exists(db, "training_rows") and column_exists(db, "training_rows", "features_json"):
-        leakage_rows = count_rows(
+        leakage_rows, leakage_sampled = bounded_training_text_match_count(
             db,
-            "training_rows",
             "coalesce(features_json,'') like '%label_value%' or coalesce(features_json,'') like '%final_outcome%' or coalesce(features_json,'') like '%settlement_value%'",
+            total_rows=total,
         )
-    feature_json_quality_condition = (
-        "coalesce(features_json,'') like '%source_quality_score%'"
-        if db is not None and column_exists(db, "training_rows", "features_json")
-        else "0"
-    )
+        feature_json_quality_rows, feature_json_quality_sampled = bounded_training_text_match_count(
+            db,
+            "coalesce(features_json,'') like '%source_quality_score%'",
+            total_rows=total,
+        )
     ladder_count = (
         count_rows(db, "signals", "coalesce(ladder_diagnostic,'') <> ''")
         if db is not None and column_exists(db, "signals", "ladder_diagnostic")
         else 0
     )
+
+    source_confidence_rows = training_coverage.get("source_confidence", 0)
+    source_quality_rows = source_confidence_rows if source_confidence_rows > 0 else feature_json_quality_rows
 
     def coverage_row(key: str, label: str, covered: int, critical: bool = True) -> dict[str, Any]:
         denominator = total if key not in {"ladder_consistency", "portfolio_risk"} else max(total, signal_rows, snapshot_rows)
@@ -405,13 +486,13 @@ def feature_family_coverage(db: sqlite3.Connection | None) -> list[dict[str, Any
         ]
     else:
         rows = [
-            coverage_row("settlement_source", features.FEATURE_FAMILIES["settlement_source"], sql_count_if(db, "training_rows", "station_id is not null or source_url is not null or source_confidence is not null")),
-            coverage_row("forecast_ensemble", features.FEATURE_FAMILIES["forecast_ensemble"], sql_count_if(db, "training_rows", "forecast_snapshot_id is not null or model_prob is not null")),
-            coverage_row("live_observation", features.FEATURE_FAMILIES["live_observation"], sql_count_if(db, "training_rows", "observation_id is not null or bucket_state is not null")),
-            coverage_row("local_time", features.FEATURE_FAMILIES["local_time"], sql_count_if(db, "training_rows", "target_date is not null and created_at is not null")),
-            coverage_row("microstructure", features.FEATURE_FAMILIES["microstructure"], sql_count_if(db, "training_rows", "orderbook_snapshot_id is not null or entry_price is not null or spread is not null or depth is not null")),
+            coverage_row("settlement_source", features.FEATURE_FAMILIES["settlement_source"], training_coverage.get("settlement_source", 0)),
+            coverage_row("forecast_ensemble", features.FEATURE_FAMILIES["forecast_ensemble"], training_coverage.get("forecast_ensemble", 0)),
+            coverage_row("live_observation", features.FEATURE_FAMILIES["live_observation"], training_coverage.get("live_observation", 0)),
+            coverage_row("local_time", features.FEATURE_FAMILIES["local_time"], training_coverage.get("local_time", 0)),
+            coverage_row("microstructure", features.FEATURE_FAMILIES["microstructure"], training_coverage.get("microstructure", 0)),
             coverage_row("ladder_consistency", features.FEATURE_FAMILIES["ladder_consistency"], ladder_count, critical=False),
-            coverage_row("source_quality", features.FEATURE_FAMILIES["source_quality"], sql_count_if(db, "training_rows", f"source_confidence is not null or {feature_json_quality_condition}")),
+            coverage_row("source_quality", features.FEATURE_FAMILIES["source_quality"], source_quality_rows),
             coverage_row("portfolio_risk", features.FEATURE_FAMILIES["portfolio_risk"], snapshot_rows, critical=False),
             {
                 "key": "no_lookahead",
@@ -469,44 +550,58 @@ def available_performance_metrics(db: sqlite3.Connection | None) -> dict[str, An
             """
         ).fetchone()
 
-    training_rows = count_rows(db, "training_rows")
-    labeled_rows = count_rows(db, "training_rows", FINAL_LABEL_WHERE)
-    paper_buy_rows = count_rows(db, "training_rows", "coalesce(signal_type,'') like 'paper_buy%'")
+    training_rows = labeled_rows = paper_buy_rows = 0
     open_positions = count_rows(db, "paper_positions", "status='open'")
     settled_positions = count_rows(db, "paper_positions", "status='settled'")
     paper_settlements = count_rows(db, "paper_settlements")
     calibration_rows = count_rows(db, "calibration_rows")
     avg_edge = paper_buy_avg_edge = brier_score = log_loss = None
     if table_exists(db, "training_rows"):
-        avg_edge = db.execute("select avg(edge) from training_rows where edge is not null").fetchone()[0]
-        paper_buy_avg_edge = db.execute(
-            "select avg(edge) from training_rows where edge is not null and coalesce(signal_type,'') like 'paper_buy%'"
-        ).fetchone()[0]
-        brier_score = db.execute(
-            """
-            select avg((model_prob - label_value) * (model_prob - label_value))
+        def present(column: str) -> bool:
+            return column_exists(db, "training_rows", column)
+
+        label_status_expr = f"label_status in ({FINAL_LABEL_STATUSES_SQL})" if present("label_status") else "0"
+        label_value_expr = "label_value in (0, 1)" if present("label_value") else "0"
+        signal_type_expr = "coalesce(signal_type,'') like 'paper_buy%'" if present("signal_type") else "0"
+        edge_expr = "edge" if present("edge") else "null"
+        model_prob_expr = "model_prob" if present("model_prob") else "null"
+        label_value_col = "label_value" if present("label_value") else "null"
+        perf_row = db.execute(
+            f"""
+            select
+              count(*) as training_rows,
+              sum(case when {label_status_expr} and {label_value_expr} then 1 else 0 end) as labeled_rows,
+              sum(case when {signal_type_expr} then 1 else 0 end) as paper_buy_rows,
+              avg({edge_expr}) as avg_edge,
+              avg(case when {signal_type_expr} then {edge_expr} end) as paper_buy_avg_edge,
+              avg(case when {model_prob_expr} is not null and {label_value_col} in (0, 1)
+                       then ({model_prob_expr} - {label_value_col}) * ({model_prob_expr} - {label_value_col}) end) as brier_score
             from training_rows
-            where model_prob is not null
-              and label_value is not null
-              and label_value in (0, 1)
             """
-        ).fetchone()[0]
-        label_rows = db.execute(
-            """
-            select model_prob, label_value
-            from training_rows
-            where model_prob is not null
-              and label_value is not null
-              and label_value in (0, 1)
-            """
-        ).fetchall()
-        if label_rows:
-            losses = []
-            for prob_raw, label_raw in label_rows:
-                prob = max(1e-6, min(1.0 - 1e-6, float(prob_raw)))
-                label = float(label_raw)
-                losses.append(-(label * math.log(prob) + (1.0 - label) * math.log(1.0 - prob)))
-            log_loss = sum(losses) / len(losses)
+        ).fetchone()
+        training_rows = int((perf_row["training_rows"] if perf_row is not None else 0) or 0)
+        labeled_rows = int((perf_row["labeled_rows"] if perf_row is not None else 0) or 0)
+        paper_buy_rows = int((perf_row["paper_buy_rows"] if perf_row is not None else 0) or 0)
+        avg_edge = perf_row["avg_edge"] if perf_row is not None else None
+        paper_buy_avg_edge = perf_row["paper_buy_avg_edge"] if perf_row is not None else None
+        brier_score = perf_row["brier_score"] if perf_row is not None else None
+        if calibration_rows <= 0 and present("model_prob") and present("label_value"):
+            label_rows = db.execute(
+                """
+                select model_prob, label_value
+                from training_rows
+                where model_prob is not null
+                  and label_value is not null
+                  and label_value in (0, 1)
+                """
+            ).fetchall()
+            if label_rows:
+                losses = []
+                for prob_raw, label_raw in label_rows:
+                    prob = max(1e-6, min(1.0 - 1e-6, float(prob_raw)))
+                    label = float(label_raw)
+                    losses.append(-(label * math.log(prob) + (1.0 - label) * math.log(1.0 - prob)))
+                log_loss = sum(losses) / len(losses)
     if table_exists(db, "calibration_rows") and calibration_rows:
         row = db.execute("select avg(brier), avg(log_loss) from calibration_rows").fetchone()
         brier_score = row[0] if row and row[0] is not None else brier_score
@@ -648,16 +743,20 @@ def evaluate_tuning_state(
         uri = f"file:{os.path.abspath(db_path)}?mode=ro"
         with sqlite3.connect(uri, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0, uri=True, isolation_level=None) as db:
             db.execute(f"pragma busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            db.execute("pragma temp_store=memory")
             db.row_factory = sqlite3.Row
-            training_rows = count_rows(db, "training_rows")
-            labeled_rows = count_rows(db, "training_rows", FINAL_LABEL_WHERE)
-            paper_buy_rows = count_rows(db, "training_rows", "coalesce(signal_type,'') like 'paper_buy%'")
+            # available_performance_metrics already scans training_rows once
+            # for counts/avg_edge/brier.  Reuse its results instead of issuing
+            # three additional count_rows queries over the same multi-GB table.
+            performance_metrics = available_performance_metrics(db)
+            training_rows = performance_metrics.get("training_rows", 0)
+            labeled_rows = performance_metrics.get("labeled_rows", 0)
+            paper_buy_rows = performance_metrics.get("paper_buy_rows", 0)
             snapshot_rows = count_rows(db, "paper_account_snapshots")
             span = calendar_days(db)
             source_families = evaluate_source_families(db, runtime_tunables)
             feature_families = feature_family_coverage(db)
             max_drawdown_seen = latest_drawdown(db)
-            performance_metrics = available_performance_metrics(db)
 
     gates = [
         {

@@ -16,6 +16,7 @@ The dashboard reads the local SQLite ledger and tuning iteration JSONL. It does 
 The dashboard includes:
 
 - Paper bankroll stats.
+- Official paper account status, including the canonical clean account name, official fills, skipped order counts, and explicit idle reasons such as below-min-entry or shadow-only gates.
 - Core row counts.
 - Evidence progress.
 - Labeling and settlement progress.
@@ -23,6 +24,7 @@ The dashboard includes:
 - Equity trail.
 - Tuning readiness and performance trace.
 - Tuning iteration performance.
+- Shadow proxy leaderboard; its `strategy_lab_rows` count includes both durable `training_rows` and paper-only `strategy_candidates` so broad shadow-lane fanout remains visible even before proxy labels exist.
 - Data sources and feature tuning.
 - Runtime tunables.
 - Latest runs.
@@ -34,7 +36,7 @@ The Labeling and Settlement Progress section shows final labeled rows, pending r
 
 ## Live Local Refresh
 
-[serve_brain_projects.py](../serve_brain_projects.py) can serve the output directory with Python stdlib HTTP. The HTML polls the JSON sidecar when opened over local HTTP. File mode uses the embedded snapshot.
+[serve_brain_projects.py](../serve_brain_projects.py) can serve the output directory with Python stdlib HTTP on localhost port 8766. Port 8765 is reserved by the authenticated Brain gateway. The HTML polls the JSON sidecar when opened over local HTTP. File mode uses the embedded snapshot.
 
 The normal render command is:
 
@@ -67,3 +69,4 @@ The cron-safe wrapper is:
 - Do not add API keys, cookies, wallets, private keys, or signing flows to dashboard code.
 - Treat the dashboard as observability and review UI, not an execution UI.
 - Keep labeler provider flags in `runtime_tunables.env`; commercial/paid providers remain disabled by default.
+- `PAPER_ACCOUNT_NAME=paper_account_v2_clean_post_gate` is the canonical official paper ledger cutover knob. Scanner account creation, order simulation, health, portfolio views, and dashboard rendering must respect it while keeping `default-paper`/archived accounts historical-only.

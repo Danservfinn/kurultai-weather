@@ -34,6 +34,8 @@ class SettlementSourceDeltaTests(unittest.TestCase):
                 family="observation",
                 status=status,
                 station_id="KLGA",
+                target_metric="daily_high",
+                observed_f=high,
                 observed_high_f=high,
                 fetched_at="2026-05-09T20:00:00+00:00",
                 source_url=f"https://example.test/{provider}",
@@ -93,7 +95,7 @@ class SettlementSourceDeltaTests(unittest.TestCase):
 
         attempts = scanner.attempt_delayed_label(candidate, args, "2026-05-10T12:00:00+00:00")
         self.assertEqual({attempt["reason"] for attempt in attempts}, {"no_station_id"})
-        self.assertEqual(len(attempts), 5)
+        self.assertEqual(len(attempts), 4)
         for attempt in attempts:
             scanner.insert_label_attempt(db, attempt)
             scanner.record_source_snapshot_from_label_attempt(db, candidate=candidate, attempt=attempt)
@@ -101,7 +103,7 @@ class SettlementSourceDeltaTests(unittest.TestCase):
         rows = db.execute(
             "select source_provider, status, error from source_observation_snapshots order by source_provider"
         ).fetchall()
-        self.assertEqual(len(rows), 5)
+        self.assertEqual(len(rows), 4)
         self.assertTrue(all(row[1] == "no_station_id" and row[2] == "no_station_id" for row in rows))
 
     def test_labeler_records_error_attempt_without_crashing(self):
@@ -158,13 +160,13 @@ class SettlementSourceDeltaTests(unittest.TestCase):
         db = self.open_db()
         args = argparse.Namespace(shadow_strategy_families="")
         self.assertEqual(scanner.classify_strategy_family("paper_buy_source_delta"), "settlement_source_delta")
-        self.assertEqual(scanner.paper_buy_shadow_only_family(args, "settlement_source_delta"), (True, "settlement_source_delta_shadow_until_labels"))
+        self.assertEqual(scanner.paper_buy_shadow_only_family(args, "settlement_source_delta"), (True, "settlement_source_delta_shadow_locked"))
         allowed, reason = scanner.source_delta_official_guard(db, station_id=None, source_key="wu:klga")
         self.assertFalse(allowed)
         self.assertIn("ambiguous", reason)
         allowed, reason = scanner.source_delta_official_guard(db, station_id="KLGA", source_key="wu:klga")
         self.assertFalse(allowed)
-        self.assertIn("shadow_until_labels", reason)
+        self.assertEqual(reason, "settlement_source_delta_official_locked")
 
     def test_station_residuals_populate_from_final_label_and_snapshot(self):
         db = self.open_db()
@@ -177,6 +179,8 @@ class SettlementSourceDeltaTests(unittest.TestCase):
             family="observation",
             status="success",
             station_id="KLGA",
+            target_metric="daily_high",
+            observed_f=80.0,
             observed_high_f=80.0,
             fetched_at="2026-05-09T20:00:00+00:00",
         )
@@ -198,15 +202,112 @@ class SettlementSourceDeltaTests(unittest.TestCase):
             "source_provider": "wu",
             "source_family": "observation",
             "source_status": "success",
+            "target_metric": "daily_high",
+            "final_observed_f": 82.0,
             "final_high_f": 82.0,
             "label_value": 1.0,
             "outcome_status": scanner.FINAL_LABEL_STATUS,
         })
-        updated = scanner.apply_final_label_to_training_rows(db, {"market_id": "m2", "outcome": "80F+", "target_date": "2026-05-09", "station_id": "KLGA"}, {"label_value": 1.0, "source_provider": "wu", "attempted_at": "2026-05-10T12:00:00+00:00"}, attempt_id)
+        updated = scanner.apply_final_label_to_training_rows(
+            db,
+            {"market_id": "m2", "outcome": "80F+", "target_date": "2026-05-09", "station_id": "KLGA", "target_metric": "daily_high"},
+            {"label_value": 1.0, "source_provider": "wu", "attempted_at": "2026-05-10T12:00:00+00:00", "target_metric": "daily_high", "final_observed_f": 82.0, "final_high_f": 82.0, "outcome_status": scanner.FINAL_LABEL_STATUS},
+            attempt_id,
+        )
         self.assertEqual(updated, 1)
         self.assertGreater(db.execute("select count(*) from calibration_rows").fetchone()[0], 0)
         row = db.execute("select sample_count, mean_residual_f, mae_f from station_residuals").fetchone()
         self.assertEqual(row, (1, 2.0, 2.0))
+
+    def test_station_residuals_populate_from_multi_provider_proxy_consensus_calibration(self):
+        db = self.open_db()
+        scanner.record_source_observation_snapshot(
+            db,
+            run_id=1,
+            market_id="m-proxy",
+            event_key="event-proxy",
+            provider="iem_metar",
+            family="daily_high",
+            status="ok",
+            station_id="KDEN",
+            target_metric="unknown",
+            observed_f=79.0,
+            observed_high_f=79.0,
+            fetched_at="2026-05-10T12:00:00+00:00",
+        )
+        cur = db.execute(
+            """
+            insert into training_rows(created_at, market_id, outcome, target_date, station_id, event_key, strategy_family, model_prob, label_status, target_metric)
+            values(?,?,?,?,?,?,?,?,?,?)
+            """,
+            ("2026-05-09T20:00:00+00:00", "m-proxy", "80F+", "2026-05-09", "KDEN", "event-proxy", "settlement_source_delta", 0.70, scanner.PENDING_LABEL_STATUS, "daily_high"),
+        )
+        training_id = cur.lastrowid
+        attempt = {
+            "attempted_at": "2026-05-12T12:00:00+00:00",
+            "training_row_id": training_id,
+            "market_id": "m-proxy",
+            "outcome": "80F+",
+            "target_date": "2026-05-09",
+            "station_id": "KDEN",
+            "source_provider": "proxy_consensus:iem_metar+nws",
+            "source_family": "proxy_consensus",
+            "source_status": "ok",
+            "target_metric": "daily_high",
+            "final_observed_f": 82.0,
+            "final_high_f": 82.0,
+            "label_value": 1.0,
+            "outcome_status": scanner.MULTI_PROVIDER_PROXY_CONSENSUS_LABEL_STATUS,
+        }
+        attempt_id = scanner.insert_label_attempt(db, attempt)
+
+        updated = scanner.apply_final_label_to_training_rows(
+            db,
+            {"market_id": "m-proxy", "outcome": "80F+", "target_date": "2026-05-09", "station_id": "KDEN", "target_metric": "daily_high"},
+            attempt,
+            attempt_id,
+        )
+
+        self.assertEqual(updated, 1)
+        cal = db.execute("select label_confidence, provider_set from calibration_rows").fetchone()
+        self.assertEqual(cal, ("multi_provider_proxy_consensus", "iem_metar+nws"))
+        row = db.execute("select station_id, source_key, sample_count, mean_residual_f, mae_f from station_residuals").fetchone()
+        self.assertEqual(row, ("KDEN", "iem_metar:kden", 1, 3.0, 3.0))
+
+    def test_single_provider_proxy_does_not_create_calibration_or_residuals(self):
+        db = self.open_db()
+        cur = db.execute(
+            """
+            insert into training_rows(created_at, market_id, outcome, target_date, station_id, event_key, strategy_family, model_prob, label_status, target_metric)
+            values(?,?,?,?,?,?,?,?,?,?)
+            """,
+            ("2026-05-09T20:00:00+00:00", "m-single", "80F+", "2026-05-09", "KDEN", "event-single", "forecast_distribution_directional", 0.70, scanner.PENDING_LABEL_STATUS, "daily_high"),
+        )
+        attempt = {
+            "attempted_at": "2026-05-12T12:00:00+00:00",
+            "training_row_id": cur.lastrowid,
+            "market_id": "m-single",
+            "outcome": "80F+",
+            "target_date": "2026-05-09",
+            "station_id": "KDEN",
+            "source_provider": "proxy_consensus:nws",
+            "source_family": "proxy_consensus",
+            "source_status": "ok",
+            "target_metric": "daily_high",
+            "final_observed_f": 82.0,
+            "final_high_f": 82.0,
+            "label_value": 1.0,
+            "outcome_status": scanner.PROXY_FINAL_LABEL_STATUS,
+        }
+        attempt_id = scanner.insert_label_attempt(db, attempt)
+        scanner.apply_final_label_to_training_rows(
+            db,
+            {"market_id": "m-single", "outcome": "80F+", "target_date": "2026-05-09", "station_id": "KDEN", "target_metric": "daily_high"},
+            attempt,
+            attempt_id,
+        )
+        self.assertEqual(db.execute("select count(*) from calibration_rows").fetchone()[0], 0)
+        self.assertEqual(db.execute("select count(*) from station_residuals").fetchone()[0], 0)
 
     def test_feature_family_exports_source_delta_without_lookahead(self):
         flat = features.build_decision_features(

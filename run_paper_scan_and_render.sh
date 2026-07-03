@@ -26,11 +26,17 @@ if [[ "${ENABLE_WU:-0}" == "1" ]]; then
 fi
 
 python3 scanner.py scan "${SCAN_ARGS[@]}"
+if [[ -f scripts/strategy_lab_shadow_backfill.py ]]; then
+  python3 scripts/strategy_lab_shadow_backfill.py \
+    --limit-per-family "${STRATEGY_LAB_SHADOW_LIMIT_PER_FAMILY:-200}" \
+    --lookback-runs "${STRATEGY_LAB_SHADOW_LOOKBACK_RUNS:-3}"
+fi
 python3 scanner.py summary
 python3 scanner.py evaluate \
   --edge-threshold "${EDGE_THRESHOLD:-0.08}" \
   --min-entry "${MIN_ENTRY:-0.02}" \
   --max-entry "${MAX_ENTRY:-0.95}"
+python3 edge_validation.py --persist
 python3 render_brain_performance.py \
   --output /Users/kublai/brain/projects/polymarket-weather-engine-performance.html \
   --json-output /Users/kublai/brain/projects/polymarket-weather-engine-performance.json

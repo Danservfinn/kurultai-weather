@@ -31,6 +31,7 @@ import settlement_states
 import touch_watchlist
 import tuning_evaluator
 import weather_sources
+import truth_tiers
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(ROOT, "paper_weather.sqlite3")
@@ -48,18 +49,48 @@ DEFAULT_BANKROLL_USD = 1000.0
 SQLITE_BUSY_TIMEOUT_MS = 5000
 RAW_EXCERPT_LIMIT = 4000
 RAW_JSON_LIMIT = 20000
-FINAL_LABEL_STATUS = "final"
-PROVISIONAL_LABEL_STATUS = "provisional"
-PENDING_LABEL_STATUS = "pending"
-SKIPPED_LABEL_STATUS = "skipped"
-ERROR_LABEL_STATUS = "error"
-LABEL_OUTCOME_STATUSES = {
-    FINAL_LABEL_STATUS,
-    PROVISIONAL_LABEL_STATUS,
-    PENDING_LABEL_STATUS,
-    SKIPPED_LABEL_STATUS,
-    ERROR_LABEL_STATUS,
-}
+FINAL_LABEL_STATUS = truth_tiers.FINAL_LABEL_STATUS
+OFFICIAL_FINAL_LABEL_STATUS = truth_tiers.OFFICIAL_FINAL_LABEL_STATUS
+PROXY_FINAL_LABEL_STATUS = truth_tiers.PROXY_FINAL_LABEL_STATUS
+MULTI_PROVIDER_PROXY_CONSENSUS_LABEL_STATUS = truth_tiers.MULTI_PROVIDER_PROXY_CONSENSUS_LABEL_STATUS
+SINGLE_PROVIDER_PROXY_LABEL_STATUS = truth_tiers.SINGLE_PROVIDER_PROXY_LABEL_STATUS
+PROVISIONAL_LABEL_STATUS = truth_tiers.PROVISIONAL_LABEL_STATUS
+PENDING_LABEL_STATUS = truth_tiers.PENDING_LABEL_STATUS
+SKIPPED_LABEL_STATUS = truth_tiers.SKIPPED_LABEL_STATUS
+ERROR_LABEL_STATUS = truth_tiers.ERROR_LABEL_STATUS
+FINAL_LABEL_OUTCOME_STATUSES = truth_tiers.FINAL_LABEL_OUTCOME_STATUSES
+LABEL_OUTCOME_STATUSES = truth_tiers.LABEL_OUTCOME_STATUSES
+
+
+def runtime_tunable_env_value(key: str) -> str | None:
+    """Read a simple KEY=value from repo-local runtime_tunables.env without mutating os.environ."""
+    path = os.path.join(ROOT, "runtime_tunables.env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                if name.strip() == key:
+                    return value.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def active_paper_account_name() -> str:
+    """Return the canonical official paper ledger account for this process."""
+    configured = os.environ.get("PAPER_ACCOUNT_NAME") or runtime_tunable_env_value("PAPER_ACCOUNT_NAME")
+    if configured and configured.strip():
+        return configured.strip()
+    return DEFAULT_ACCOUNT_NAME
+
+
+TARGET_METRIC_DAILY_HIGH = "daily_high"
+TARGET_METRIC_DAILY_LOW = "daily_low"
+TARGET_METRIC_UNKNOWN = "unknown"
+TARGET_METRICS = {TARGET_METRIC_DAILY_HIGH, TARGET_METRIC_DAILY_LOW, TARGET_METRIC_UNKNOWN}
 TRAINING_EXPORT_COLUMNS = [
     "id",
     "created_at",
@@ -72,6 +103,7 @@ TRAINING_EXPORT_COLUMNS = [
     "city",
     "target_date",
     "station_id",
+    "target_metric",
     "station_source",
     "source_url",
     "provider",
@@ -353,14 +385,77 @@ def fetch_text_optional(url: str, timeout: int = 15) -> str | None:
 
 
 def extract_next_json(page: str) -> Any:
-    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page, re.S)
+    m = re.search(
+        r'<script\b(?=[^>]*\bid=["\']__NEXT_DATA__["\'])(?=[^>]*\btype=["\']application/json["\'])[^>]*>(.*?)</script>',
+        page,
+        re.S,
+    )
     if m:
         return json.loads(html.unescape(m.group(1)))
     b = re.search(r'"buildId":"([^"]+)"', page)
     if b:
         data_url = f"https://polymarket.com/_next/data/{b.group(1)}/en/climate-science/weather.json"
         return json.loads(fetch_json_text(data_url))
+    flight_rows = extract_next_flight_json_rows(page)
+    if flight_rows:
+        return {"__next_f": flight_rows}
     raise ValueError("No Next.js JSON found in page")
+
+
+def extract_next_flight_json_rows(page: str) -> list[Any]:
+    """Extract JSON rows embedded in Next App Router React Flight pushes.
+
+    Polymarket's weather page can ship data through ``self.__next_f.push``
+    scripts instead of the legacy ``__NEXT_DATA__`` blob. Each push argument is
+    JSON, and its string payload contains newline-delimited Flight rows like
+    ``21:[...]``. Only rows whose payload is a JSON object/array are returned;
+    module preload rows such as ``11:I[...]`` or ``:HL[...]`` are ignored.
+    """
+    rows: list[Any] = []
+    for match in re.finditer(r"<script\b[^>]*>(.*?)</script>", page, re.S):
+        body = match.group(1).strip()
+        if "__next_f" not in body or ".push(" not in body:
+            continue
+        push_start = body.find(".push(")
+        arg_start = push_start + len(".push(")
+        arg_end = body.rfind(")")
+        if push_start < 0 or arg_end <= arg_start:
+            continue
+        try:
+            push_arg = json.loads(body[arg_start:arg_end].strip())
+        except json.JSONDecodeError:
+            continue
+        rows.extend(parse_next_flight_json_rows(push_arg))
+    return rows
+
+
+def parse_next_flight_json_rows(push_arg: Any) -> list[Any]:
+    payloads: list[str] = []
+    if isinstance(push_arg, list):
+        payloads.extend(item for item in push_arg[1:] if isinstance(item, str))
+    elif isinstance(push_arg, str):
+        payloads.append(push_arg)
+
+    decoder = json.JSONDecoder()
+    rows: list[Any] = []
+    for payload in payloads:
+        for line in payload.splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            row_id, row_payload = line.split(":", 1)
+            if not row_id or not re.fullmatch(r"[0-9A-Fa-f]+", row_id):
+                continue
+            row_payload = row_payload.lstrip()
+            if not row_payload.startswith(("{", "[")):
+                continue
+            try:
+                value, _ = decoder.raw_decode(row_payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, (dict, list)):
+                rows.append(value)
+    return rows
 
 
 def walk(obj: Any):
@@ -406,6 +501,8 @@ def utc_now_iso() -> str:
 
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
+    if value is None:
+        value = runtime_tunable_env_value(name)
     if value is None:
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
@@ -1692,7 +1789,7 @@ def init_db(path: str) -> sqlite3.Connection:
           source_key text, provider text not null, source_provider text,
           family text not null, status text not null,
           station_id text, observed_at text, fetched_at text not null, local_date text,
-          observed_high_f real, current_temp_f real, source_url text, provenance_json text,
+          target_metric text, observed_f real, observed_high_f real, current_temp_f real, source_url text, provenance_json text,
           raw_excerpt text, error text, created_at text not null
         );
         create table if not exists station_residuals (
@@ -1719,7 +1816,7 @@ def init_db(path: str) -> sqlite3.Connection:
         create table if not exists training_rows (
           id integer primary key, run_id integer, signal_id integer, created_at text not null,
           market_id text, title text, outcome text, token_id text, city text,
-          target_date text, station_id text, station_source text, source_url text,
+          target_date text, station_id text, target_metric text, station_source text, source_url text,
           provider text, forecast_snapshot_id integer, observation_id integer,
           orderbook_snapshot_id integer, market_family text, eligibility_class text,
           source_confidence text, bucket_lo_f real, bucket_hi_f real, bucket_kind text,
@@ -1734,7 +1831,7 @@ def init_db(path: str) -> sqlite3.Connection:
           position_id integer, market_id text, title text, outcome text,
           target_date text, station_id text, source_provider text not null,
           source_family text, source_url text, source_status text,
-          station_confidence text, final_high_f real, threshold_low_f real,
+          station_confidence text, target_metric text, final_observed_f real, final_high_f real, threshold_low_f real,
           threshold_high_f real, label_value real, outcome_status text not null,
           reason text, provenance_json text, raw_excerpt text
         );
@@ -1821,7 +1918,8 @@ def init_db(path: str) -> sqlite3.Connection:
           event_key text, strategy_family text, contract_type text,
           market_family text, event_time_bucket text, prediction_prob real,
           label_value real, brier real, log_loss real, label_source text,
-          created_at text not null
+          label_attempt_id integer, target_metric text, final_observed_f real,
+          label_confidence text, provider_set text, created_at text not null
         );
         create table if not exists touch_watchlist (
           event_key text not null,
@@ -1979,9 +2077,18 @@ def init_db(path: str) -> sqlite3.Connection:
             "label_value": "real",
             "label_source": "text",
             "labeled_at": "text",
+            "city": "text",
+            "station_id": "text",
+            "station_source": "text",
+            "source_confidence": "text",
+            "market_family": "text",
+            "target_metric": "text",
+            "target_date": "text",
             "event_key": "text",
             "candidate_key": "text",
             "strategy_family": "text",
+            "signal_type": "text",
+            "edge": "real",
             "contract_type": "text",
             "settlement_state": "text",
             "early_state": "text",
@@ -2007,6 +2114,8 @@ def init_db(path: str) -> sqlite3.Connection:
             "source_url": "text",
             "source_status": "text",
             "station_confidence": "text",
+            "target_metric": "text",
+            "final_observed_f": "real",
             "final_high_f": "real",
             "threshold_low_f": "real",
             "threshold_high_f": "real",
@@ -2034,8 +2143,12 @@ def init_db(path: str) -> sqlite3.Connection:
         "source_observation_snapshots",
         {
             "source_provider": "text",
+            "target_metric": "text",
+            "observed_f": "real",
         },
     )
+    db.execute("update source_observation_snapshots set observed_f=observed_high_f where observed_f is null and observed_high_f is not null")
+    db.execute("update source_observation_snapshots set target_metric=? where target_metric is null and observed_high_f is not null", (TARGET_METRIC_DAILY_HIGH,))
     db.execute(
         "update source_observation_snapshots set source_provider=provider where source_provider is null and provider is not null"
     )
@@ -2106,6 +2219,37 @@ def init_db(path: str) -> sqlite3.Connection:
             "calibration_row_id": "integer",
         },
     )
+    ensure_columns(
+        db,
+        "calibration_rows",
+        {
+            "label_attempt_id": "integer",
+            "target_metric": "text",
+            "final_observed_f": "real",
+            "label_confidence": "text",
+            "provider_set": "text",
+        },
+    )
+    db.executescript(
+        """
+        create index if not exists idx_source_obs_provider_status on source_observation_snapshots(source_provider, provider, status);
+        create index if not exists idx_signals_title_outcome_id on signals(title, outcome, id);
+        create index if not exists idx_signals_signaltype_edge_market_entry on signals(signal_type, edge, market_prob, entry_price);
+        create index if not exists idx_training_label_status_value on training_rows(label_status, label_value);
+        create index if not exists idx_training_signal_type on training_rows(signal_type);
+        create index if not exists idx_training_created_at on training_rows(created_at);
+        create index if not exists idx_training_edge on training_rows(edge);
+        create index if not exists idx_training_target_date_label on training_rows(target_date, label_status);
+        create index if not exists idx_training_labeler_candidates
+          on training_rows(target_date, label_status, market_family, market_id, outcome, station_id, target_metric, id);
+        create index if not exists idx_training_strategy_family on training_rows(strategy_family);
+        create index if not exists idx_calibration_conf_family on calibration_rows(label_confidence, label_source, strategy_family);
+        create index if not exists idx_calibration_event on calibration_rows(event_key, training_row_id);
+        create index if not exists idx_label_attempts_status_provider on label_attempts(outcome_status, source_provider);
+        create index if not exists idx_label_attempts_candidate_metric
+          on label_attempts(market_id, outcome, target_date, station_id, target_metric, attempted_at);
+        """
+    )
     seed_station_registry(db)
     ensure_paper_account(db, utc_now_iso())
     db.commit()
@@ -2152,8 +2296,27 @@ def seed_station_registry(db: sqlite3.Connection) -> None:
         )
 
 
-def ensure_paper_account(db: sqlite3.Connection, now: str, starting_cash: float = DEFAULT_BANKROLL_USD) -> int:
-    row = db.execute("select id from paper_accounts where name=?", (DEFAULT_ACCOUNT_NAME,)).fetchone()
+def normalize_target_metric(value: str | None) -> str:
+    text = str(value or TARGET_METRIC_DAILY_HIGH).strip().lower().replace("-", "_")
+    return text if text in TARGET_METRICS else TARGET_METRIC_UNKNOWN
+
+
+def label_confidence_for_attempt(outcome_status: str | None, provider_set: str | None = "") -> str:
+    return truth_tiers.tier_for_label(outcome_status, provider_set)
+
+
+def provider_set_json(value: Any) -> str:
+    return json.dumps(truth_tiers.normalized_provider_set(value), sort_keys=True)
+
+
+def ensure_paper_account(
+    db: sqlite3.Connection,
+    now: str,
+    starting_cash: float = DEFAULT_BANKROLL_USD,
+    account_name: str | None = None,
+) -> int:
+    name = (account_name or active_paper_account_name()).strip() or DEFAULT_ACCOUNT_NAME
+    row = db.execute("select id from paper_accounts where name=?", (name,)).fetchone()
     if row:
         return int(row[0])
     cur = db.execute(
@@ -2161,7 +2324,7 @@ def ensure_paper_account(db: sqlite3.Connection, now: str, starting_cash: float 
         insert into paper_accounts(name, starting_cash, cash, realized_pnl, created_at, updated_at)
         values(?,?,?,?,?,?)
         """,
-        (DEFAULT_ACCOUNT_NAME, starting_cash, starting_cash, 0.0, now, now),
+        (name, starting_cash, starting_cash, 0.0, now, now),
     )
     return int(cur.lastrowid)
 
@@ -2491,21 +2654,44 @@ def record_calibration_rows_for_training_ids(
     if not row_ids:
         return 0
     placeholders = ",".join("?" for _ in row_ids)
+    attempt_meta = None
+    if label_attempt_id is not None:
+        attempt_meta = db.execute(
+            """
+            select outcome_status, source_provider, target_metric, final_observed_f, final_high_f
+            from label_attempts where id=?
+            """,
+            (label_attempt_id,),
+        ).fetchone()
+    confidence = truth_tiers.TruthTier.OFFICIAL_NCEI.value
+    provider_set = ""
+    target_metric = TARGET_METRIC_DAILY_HIGH
+    final_observed_f = None
+    if attempt_meta is not None:
+        confidence = label_confidence_for_attempt(attempt_meta[0], attempt_meta[1])
+        providers = truth_tiers.normalized_provider_set(attempt_meta[1])
+        provider_set = "+".join(providers)
+        target_metric = normalize_target_metric(attempt_meta[2])
+        final_observed_f = attempt_meta[3] if attempt_meta[3] is not None else attempt_meta[4]
+        if confidence not in {truth_tiers.TruthTier.OFFICIAL_NCEI.value, truth_tiers.TruthTier.MULTI_PROVIDER_PROXY_CONSENSUS.value}:
+            return 0
     rows = db.execute(
         f"""
         select id, event_key, strategy_family, contract_type, market_family,
-               model_prob, label_value, features_json, candidate_key
+               model_prob, label_value, features_json, candidate_key,
+               coalesce(target_metric, ?)
         from training_rows
         where id in ({placeholders})
           and model_prob is not null
           and label_value in (0, 1)
         """,
-        row_ids,
+        [TARGET_METRIC_DAILY_HIGH, *row_ids],
     ).fetchall()
     count = 0
     for row in rows:
         prob = max(1e-6, min(1.0 - 1e-6, float(row[5])))
         label_value = float(row[6])
+        row_target_metric = normalize_target_metric(target_metric or row[9])
         brier = (prob - label_value) * (prob - label_value)
         log_loss = -(label_value * math.log(prob) + (1.0 - label_value) * math.log(1.0 - prob))
         cur = db.execute(
@@ -2513,9 +2699,10 @@ def record_calibration_rows_for_training_ids(
             insert into calibration_rows(
               training_row_id, event_key, strategy_family, contract_type,
               market_family, event_time_bucket, prediction_prob, label_value,
-              brier, log_loss, label_source, created_at
+              brier, log_loss, label_source, created_at, label_attempt_id,
+              target_metric, final_observed_f, label_confidence, provider_set
             )
-            values(?,?,?,?,?,?,?,?,?,?,?,?)
+            values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             on conflict(training_row_id) do update set
               event_key=excluded.event_key,
               strategy_family=excluded.strategy_family,
@@ -2527,7 +2714,12 @@ def record_calibration_rows_for_training_ids(
               brier=excluded.brier,
               log_loss=excluded.log_loss,
               label_source=excluded.label_source,
-              created_at=excluded.created_at
+              created_at=excluded.created_at,
+              label_attempt_id=excluded.label_attempt_id,
+              target_metric=excluded.target_metric,
+              final_observed_f=excluded.final_observed_f,
+              label_confidence=excluded.label_confidence,
+              provider_set=excluded.provider_set
             """,
             (
                 row[0],
@@ -2542,6 +2734,11 @@ def record_calibration_rows_for_training_ids(
                 log_loss,
                 label_source,
                 now,
+                label_attempt_id,
+                row_target_metric,
+                final_observed_f,
+                confidence,
+                provider_set,
             ),
         )
         calibration_id = int(cur.lastrowid or 0)
@@ -2790,10 +2987,11 @@ def record_training_row(
 
 
 def account_row(db: sqlite3.Connection) -> sqlite3.Row | tuple[Any, ...]:
-    row = db.execute("select id, starting_cash, cash, realized_pnl from paper_accounts where name=?", (DEFAULT_ACCOUNT_NAME,)).fetchone()
+    name = active_paper_account_name()
+    row = db.execute("select id, starting_cash, cash, realized_pnl from paper_accounts where name=?", (name,)).fetchone()
     if not row:
-        ensure_paper_account(db, utc_now_iso())
-        row = db.execute("select id, starting_cash, cash, realized_pnl from paper_accounts where name=?", (DEFAULT_ACCOUNT_NAME,)).fetchone()
+        ensure_paper_account(db, utc_now_iso(), account_name=name)
+        row = db.execute("select id, starting_cash, cash, realized_pnl from paper_accounts where name=?", (name,)).fetchone()
     return row
 
 
@@ -2872,6 +3070,8 @@ def record_source_observation_snapshot(
     observed_at: str | None = None,
     fetched_at: str | None = None,
     local_date: str | None = None,
+    target_metric: str | None = None,
+    observed_f: float | None = None,
     observed_high_f: float | None = None,
     current_temp_f: float | None = None,
     source_url: str | None = None,
@@ -2893,7 +3093,14 @@ def record_source_observation_snapshot(
     station_id = station_id or data.get("station_id")
     observed_at = observed_at or data.get("observed_at") or data.get("obs_time_utc")
     local_date = local_date or data.get("local_date")
+    target_metric = normalize_target_metric(target_metric or data.get("target_metric") or TARGET_METRIC_DAILY_HIGH)
+    if observed_f is None:
+        observed_f = data.get("observed_f")
+    if observed_f is None and target_metric == TARGET_METRIC_DAILY_LOW:
+        observed_f = data.get("daily_low_f", data.get("low_so_far_f"))
     observed_high_f = observed_high_f if observed_high_f is not None else data.get("daily_high_f", data.get("high_so_far_f"))
+    if observed_f is None:
+        observed_f = observed_high_f
     current_temp_f = current_temp_f if current_temp_f is not None else data.get("current_temp_f")
     source_key = upsert_settlement_source_registry(db, provider=provider, family=family, station_id=station_id, source_url=source_url, now=now)
     raw_excerpt = None if raw_excerpt is None else str(raw_excerpt)[:RAW_EXCERPT_LIMIT]
@@ -2901,13 +3108,14 @@ def record_source_observation_snapshot(
         """
         insert into source_observation_snapshots(
           run_id, market_id, event_key, source_key, provider, source_provider, family, status, station_id,
-          observed_at, fetched_at, local_date, observed_high_f, current_temp_f, source_url,
+          observed_at, fetched_at, local_date, target_metric, observed_f, observed_high_f, current_temp_f, source_url,
           provenance_json, raw_excerpt, error, created_at
-        ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             run_id, market_id, event_key, source_key, provider, provider, family, status, station_id,
-            observed_at, fetched_at, local_date,
+            observed_at, fetched_at, local_date, target_metric,
+            float(observed_f) if observed_f is not None else None,
             float(observed_high_f) if observed_high_f is not None else None,
             float(current_temp_f) if current_temp_f is not None else None,
             source_url, bounded_json(provenance, RAW_JSON_LIMIT), raw_excerpt, error, now,
@@ -2955,11 +3163,7 @@ def source_delta_probability(delta_f: float | None, *, calibration_count: int = 
 def source_delta_official_guard(db: sqlite3.Connection, *, station_id: str | None, source_key: str | None = None) -> tuple[bool, str]:
     if not station_id or not source_key:
         return False, "source_delta_ambiguous_station_or_source"
-    labels = db.execute("select count(*) from label_attempts where outcome_status=?", (FINAL_LABEL_STATUS,)).fetchone()[0]
-    cals = db.execute("select count(*) from calibration_rows").fetchone()[0]
-    if int(labels or 0) < 300 or int(cals or 0) < 300:
-        return False, "source_delta_shadow_until_labels_and_calibration"
-    return True, "source_delta_official_allowed"
+    return False, "settlement_source_delta_official_locked"
 
 
 def refresh_station_residuals(db: sqlite3.Connection, *, now: str | None = None) -> int:
@@ -2969,23 +3173,36 @@ def refresh_station_residuals(db: sqlite3.Connection, *, now: str | None = None)
         select coalesce(tr.station_id, la.station_id) as station_id,
                coalesce(sos.source_key, la.source_provider) as source_key,
                coalesce(tr.strategy_family, 'unknown') as strategy_family,
-               (la.final_high_f - sos.observed_high_f) as residual_f,
-               la.attempted_at
-        from label_attempts la
-        join training_rows tr on tr.id=la.training_row_id
-        left join source_observation_snapshots sos
+               (coalesce(cr.final_observed_f, la.final_observed_f, la.final_high_f) - sos.observed_f) as residual_f,
+               coalesce(la.attempted_at, cr.created_at) as label_at
+        from calibration_rows cr
+        join training_rows tr on tr.id=cr.training_row_id
+        left join label_attempts la on la.id=cr.label_attempt_id
+        join source_observation_snapshots sos
           on (sos.event_key=tr.event_key or sos.market_id=tr.market_id)
-         and sos.observed_high_f is not null
-        where la.outcome_status=?
-          and la.final_high_f is not null
-          and sos.observed_high_f is not null
+         and coalesce(nullif(sos.target_metric, ?), ?) = coalesce(nullif(cr.target_metric, ?), nullif(tr.target_metric, ?), nullif(la.target_metric, ?), ?)
+         and sos.observed_f is not null
+        where coalesce(cr.label_confidence, ?) in (?, ?)
+          and coalesce(cr.final_observed_f, la.final_observed_f, la.final_high_f) is not null
           and coalesce(tr.station_id, la.station_id, '') <> ''
         """,
-        (FINAL_LABEL_STATUS,),
+        (
+            TARGET_METRIC_UNKNOWN,
+            TARGET_METRIC_DAILY_HIGH,
+            TARGET_METRIC_UNKNOWN,
+            TARGET_METRIC_UNKNOWN,
+            TARGET_METRIC_UNKNOWN,
+            TARGET_METRIC_DAILY_HIGH,
+            truth_tiers.TruthTier.UNKNOWN.value,
+            truth_tiers.TruthTier.OFFICIAL_NCEI.value,
+            truth_tiers.TruthTier.MULTI_PROVIDER_PROXY_CONSENSUS.value,
+        ),
     ).fetchall()
     grouped: dict[tuple[str, str, str], list[tuple[float, str | None]]] = {}
-    for station_id, source_key, strategy_family, residual, attempted_at in rows:
-        grouped.setdefault((str(station_id), str(source_key or "unknown"), str(strategy_family or "unknown")), []).append((float(residual), attempted_at))
+    for station_id, source_key, strategy_family, residual, label_at in rows:
+        if residual is None:
+            continue
+        grouped.setdefault((str(station_id), str(source_key or "unknown"), str(strategy_family or "unknown")), []).append((float(residual), label_at))
     for (station_id, source_key, strategy_family), vals in grouped.items():
         residuals = [v[0] for v in vals]
         mean = sum(residuals) / len(residuals)
@@ -3130,7 +3347,7 @@ def paper_buy_shadow_only_family(
     db: sqlite3.Connection | None = None,
 ) -> tuple[bool, str | None]:
     if family == "settlement_source_delta":
-        return True, "settlement_source_delta_shadow_until_labels"
+        return True, "settlement_source_delta_shadow_locked"
     if family == "ladder_inconsistency":
         return ladder_shadow_gate(db, args)
     configured = getattr(args, "shadow_strategy_families", None)
@@ -3548,6 +3765,7 @@ def portfolio_metrics(db: sqlite3.Connection) -> dict[str, Any]:
     drawdown = 0.0 if high_water <= 0 else max(0.0, (high_water - equity) / high_water)
     return {
         "account_id": account_id,
+        "account_name": active_paper_account_name(),
         "starting_cash": starting_cash,
         "cash": cash,
         "open_exposure": open_cost,
@@ -4196,6 +4414,7 @@ def build_label_attempt(
 ) -> dict[str, Any]:
     provider = source_record.provider if source_record else source_provider
     family = source_record.family if source_record else source_family
+    target_metric = normalize_target_metric(candidate.get("target_metric"))
     provenance = source_record.to_dict() if source_record else {
         "provider": provider,
         "family": family,
@@ -4217,6 +4436,8 @@ def build_label_attempt(
         "source_url": source_record.source_url if source_record else None,
         "source_status": source_record.status if source_record else source_status,
         "station_confidence": label_station_confidence(candidate, provider, outcome_status),
+        "target_metric": target_metric,
+        "final_observed_f": final_high_f,
         "final_high_f": final_high_f,
         "threshold_low_f": finite_or_none(bucket.lo if bucket else None),
         "threshold_high_f": finite_or_none(bucket.hi if bucket else None),
@@ -4239,8 +4460,6 @@ def enabled_label_source_specs(args: argparse.Namespace) -> list[tuple[str, str]
         specs.append(("iem_metar", "iem_metar"))
     if getattr(args, "enable_metar_direct", False):
         specs.append(("aviationweather_metar", "metar_direct"))
-    if getattr(args, "enable_meteostat", False):
-        specs.append(("meteostat", "meteostat"))
     return specs
 
 
@@ -4302,6 +4521,8 @@ def record_source_snapshot_from_label_attempt(
         observed_at=data.get("observed_at") or data.get("obs_time_utc") or attempt.get("attempted_at"),
         fetched_at=getattr(record, "fetched_at", None) if record is not None else attempt.get("attempted_at"),
         local_date=data.get("local_date") or attempt.get("target_date") or candidate.get("target_date"),
+        target_metric=attempt.get("target_metric") or candidate.get("target_metric"),
+        observed_f=attempt.get("final_observed_f"),
         observed_high_f=attempt.get("final_high_f") if outcome_status in {FINAL_LABEL_STATUS, PROVISIONAL_LABEL_STATUS} else data.get("daily_high_f", data.get("high_so_far_f")),
         source_url=attempt.get("source_url"),
         raw_excerpt=attempt.get("raw_excerpt"),
@@ -4325,6 +4546,8 @@ def insert_label_attempt(db: sqlite3.Connection, attempt: dict[str, Any]) -> int
         "source_url",
         "source_status",
         "station_confidence",
+        "target_metric",
+        "final_observed_f",
         "final_high_f",
         "threshold_low_f",
         "threshold_high_f",
@@ -4350,6 +4573,7 @@ def matching_unlabeled_training_row_ids(db: sqlite3.Connection, candidate: dict[
           and coalesce(outcome,'')=coalesce(?, '')
           and coalesce(target_date,'')=coalesce(?, '')
           and coalesce(station_id,'')=coalesce(?, '')
+          and coalesce(target_metric, ?) = coalesce(?, coalesce(target_metric, ?))
           and coalesce(label_status,'') <> ?
         """,
         (
@@ -4357,6 +4581,9 @@ def matching_unlabeled_training_row_ids(db: sqlite3.Connection, candidate: dict[
             candidate.get("outcome"),
             candidate.get("target_date"),
             candidate.get("station_id"),
+            TARGET_METRIC_DAILY_HIGH,
+            candidate.get("target_metric"),
+            TARGET_METRIC_DAILY_HIGH,
             FINAL_LABEL_STATUS,
         ),
     ).fetchall()
@@ -4426,8 +4653,46 @@ def label_candidate_groups(
         return []
     rows = db.execute(
         """
+        with candidate_groups as (
+          select
+            min(id) as training_row_id,
+            coalesce(market_id,'') as market_id_key,
+            coalesce(outcome,'') as outcome_key,
+            target_date as target_date_key,
+            coalesce(station_id,'') as station_id_key,
+            coalesce(target_metric, ?) as target_metric_key
+          from training_rows indexed by idx_training_labeler_candidates
+          where target_date is not null
+            and target_date <> ''
+            and target_date <= ?
+            and (label_status is null or label_status <> ?)
+            and (market_family is null or market_family='' or market_family='daily_temperature')
+          group by
+            coalesce(market_id,''),
+            coalesce(outcome,''),
+            target_date,
+            coalesce(station_id,''),
+            coalesce(target_metric, ?)
+        ),
+        latest_attempts as (
+          select
+            coalesce(market_id,'') as market_id_key,
+            coalesce(outcome,'') as outcome_key,
+            target_date as target_date_key,
+            coalesce(station_id,'') as station_id_key,
+            coalesce(target_metric, ?) as target_metric_key,
+            min(attempted_at) as first_attempt,
+            max(attempted_at) as latest_attempt
+          from label_attempts indexed by idx_label_attempts_candidate_metric
+          group by
+            coalesce(market_id,''),
+            coalesce(outcome,''),
+            target_date,
+            coalesce(station_id,''),
+            coalesce(target_metric, ?)
+        )
         select
-          min(tr.id) as training_row_id,
+          cg.training_row_id,
           tr.market_id,
           tr.title,
           tr.outcome,
@@ -4438,25 +4703,31 @@ def label_candidate_groups(
           tr.source_confidence,
           tr.market_family,
           tr.event_key,
-          min(la.attempted_at) as first_attempt,
-          max(la.attempted_at) as latest_attempt
-        from training_rows tr
-        left join label_attempts la
-          on coalesce(la.market_id,'')=coalesce(tr.market_id,'')
-         and coalesce(la.outcome,'')=coalesce(tr.outcome,'')
-         and coalesce(la.target_date,'')=coalesce(tr.target_date,'')
-         and coalesce(la.station_id,'')=coalesce(tr.station_id,'')
-        where tr.target_date is not null
-          and tr.target_date <> ''
-          and tr.target_date <= ?
-          and coalesce(tr.label_status,'') <> ?
-          and (tr.market_family is null or tr.market_family='' or tr.market_family='daily_temperature')
-        group by tr.market_id, tr.outcome, tr.target_date, tr.station_id
-        having latest_attempt is null or latest_attempt < ?
-        order by tr.target_date asc, training_row_id asc
+          la.first_attempt,
+          la.latest_attempt,
+          cg.target_metric_key
+        from candidate_groups cg
+        join training_rows tr on tr.id=cg.training_row_id
+        left join latest_attempts la
+          on la.market_id_key=cg.market_id_key
+         and la.outcome_key=cg.outcome_key
+         and la.target_date_key=cg.target_date_key
+         and la.station_id_key=cg.station_id_key
+         and la.target_metric_key=cg.target_metric_key
+        where la.latest_attempt is null or la.latest_attempt < ?
+        order by case when cg.station_id_key <> '' then 0 else 1 end, tr.target_date asc, cg.training_row_id asc
         limit ?
         """,
-        (cutoff_date, FINAL_LABEL_STATUS, retry_before, limit),
+        (
+            TARGET_METRIC_DAILY_HIGH,
+            cutoff_date,
+            FINAL_LABEL_STATUS,
+            TARGET_METRIC_DAILY_HIGH,
+            TARGET_METRIC_DAILY_HIGH,
+            TARGET_METRIC_DAILY_HIGH,
+            retry_before,
+            limit,
+        ),
     ).fetchall()
     return [
         {
@@ -4473,6 +4744,7 @@ def label_candidate_groups(
             "event_key": row[10],
             "first_attempt": row[11],
             "latest_attempt": row[12],
+            "target_metric": row[13],
             "position_id": None,
         }
         for row in rows
@@ -4948,7 +5220,7 @@ def health(args: argparse.Namespace) -> None:
     print(f"report={args.report}")
     print(" ".join(f"{k}={v}" for k, v in counts.items()))
     print(
-        f"paper_account={DEFAULT_ACCOUNT_NAME} cash={metrics['cash']:.2f} "
+        f"paper_account={metrics.get('account_name', active_paper_account_name())} cash={metrics['cash']:.2f} "
         f"equity={metrics['equity']:.2f} open_exposure={metrics['open_exposure']:.2f} "
         f"return={metrics['return_pct']:+.2%} drawdown={metrics['drawdown']:.2%}"
     )
@@ -5068,10 +5340,11 @@ def portfolio(args: argparse.Namespace) -> None:
         """
         select market_id, outcome, shares, avg_price, cost_basis, latest_mark, status, updated_at
         from paper_positions
+        where account_id=?
         order by updated_at desc, id desc
         limit ?
         """,
-        (args.positions,),
+        (metrics["account_id"], args.positions),
     ).fetchall()
     for market_id, outcome, shares, avg_price, cost_basis, latest_mark, status, updated_at in rows:
         mark = "" if latest_mark is None else f"{float(latest_mark):.3f}"

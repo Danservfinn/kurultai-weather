@@ -149,10 +149,10 @@ Each candidate receives an `event_key` derived from city, target date, source, s
 The brain performance artifact can be opened directly as a file, but browsers usually block `file://` JSON polling. For live refresh, serve the brain projects directory with the stdlib-only helper:
 
 ```bash
-python3 serve_brain_projects.py --port 8765
+python3 serve_brain_projects.py --port 8766
 ```
 
-Then open `http://127.0.0.1:8765/polymarket-weather-engine-performance.html`. The page only polls the local JSON snapshot written by `render_brain_performance.py`; it does not expose trading, wallet, signing, API-key, or order-placement controls.
+Then open `http://127.0.0.1:8766/polymarket-weather-engine-performance.html`. Port 8765 is reserved for the authenticated Brain gateway on the Mac mini; the dashboard viewer stays on localhost port 8766 and only polls the local JSON snapshot written by `render_brain_performance.py`. It does not expose trading, wallet, signing, API-key, or order-placement controls.
 
 ## Known Gaps
 

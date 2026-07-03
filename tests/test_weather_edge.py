@@ -18,6 +18,123 @@ import weather_sources
 
 
 class WeatherEdgeTests(unittest.TestCase):
+    def test_runtime_tunables_env_selects_clean_account_for_direct_cli_use(self):
+        old_account_name = os.environ.pop("PAPER_ACCOUNT_NAME", None)
+        try:
+            self.assertEqual(scanner.active_paper_account_name(), "paper_account_v2_clean_post_gate")
+        finally:
+            if old_account_name is not None:
+                os.environ["PAPER_ACCOUNT_NAME"] = old_account_name
+
+    def test_paper_scan_wrapper_persists_strategy_survival_snapshot(self):
+        with open(os.path.join(ROOT, "run_paper_scan_and_render.sh"), encoding="utf-8") as f:
+            wrapper = f.read()
+        self.assertIn("edge_validation.py", wrapper)
+        self.assertIn("--persist", wrapper)
+
+    def test_env_paper_account_name_routes_official_orders_to_clean_account(self):
+        old_account_name = os.environ.get("PAPER_ACCOUNT_NAME")
+        os.environ["PAPER_ACCOUNT_NAME"] = "paper_account_v2_clean_post_gate"
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+                args = argparse.Namespace(
+                    disable_ledger=False,
+                    paper_size=5.0,
+                    min_fill_shares=1.0,
+                    min_entry=0.02,
+                    max_entry=0.95,
+                    max_spread=0.08,
+                    max_position_pct=0.50,
+                    max_city_date_pct=0.50,
+                    max_open_exposure_pct=0.50,
+                    allow_weak_families=True,
+                    disable_weak_families=False,
+                    strict_survival_gate=False,
+                    shadow_ladder_inconsistency=False,
+                    shadow_strategy_families="",
+                )
+                scanner.simulate_paper_order(
+                    db,
+                    args,
+                    run_id=1,
+                    signal_id=2,
+                    created_at="2026-06-06T00:00:00Z",
+                    m={"market_id": "clean-route", "title": "Clean routing weather test"},
+                    outcome="Yes",
+                    token_id="tok-clean",
+                    city="Denver",
+                    target_date="2026-06-06",
+                    signal_type="paper_buy_edge",
+                    quote={
+                        "entry_price": 0.40,
+                        "ask": 0.40,
+                        "spread": 0.01,
+                        "depth": 10.0,
+                        "depth_sufficient": True,
+                        "execution_source": "clob_book",
+                        "quote_age_seconds": 1.0,
+                        "stale_book_flag": False,
+                        "raw_status": "ok",
+                    },
+                    event_key="event-clean-route",
+                    candidate_key="cand-clean-route",
+                    strategy_family="latency_absorbing_state",
+                )
+
+                order_account = db.execute(
+                    """
+                    select pa.name
+                    from paper_orders po
+                    join paper_accounts pa on pa.id = po.account_id
+                    """
+                ).fetchone()[0]
+                self.assertEqual(order_account, "paper_account_v2_clean_post_gate")
+                self.assertEqual(
+                    db.execute("select count(*) from paper_orders where account_id=(select id from paper_accounts where name='default-paper')").fetchone()[0],
+                    0,
+                )
+                db.close()
+        finally:
+            if old_account_name is None:
+                os.environ.pop("PAPER_ACCOUNT_NAME", None)
+            else:
+                os.environ["PAPER_ACCOUNT_NAME"] = old_account_name
+
+    def test_extract_next_json_accepts_extra_script_attributes(self):
+        page = (
+            '<html><script id="__NEXT_DATA__" type="application/json" crossorigin="anonymous">'
+            '{"props":{"pageProps":{"markets":[{"question":"Weather?","outcomes":["Yes","No"]}]}}}'
+            '</script></html>'
+        )
+        data = scanner.extract_next_json(page)
+        self.assertEqual(data["props"]["pageProps"]["markets"][0]["question"], "Weather?")
+
+    def test_extract_next_json_accepts_app_router_flight_payload_markets(self):
+        market = {
+            "id": "m-app-router",
+            "conditionId": "0xabc",
+            "question": "Will the highest temperature in Test City be 80°F on June 30?",
+            "slug": "highest-temperature-in-test-city-on-june-30-2026-80f",
+            "resolutionSource": "https://www.wunderground.com/history/daily/us/co/denver/KDEN",
+            "outcomes": ["Yes", "No"],
+            "outcomePrices": ["0.25", "0.75"],
+            "clobTokenIds": ["tok-yes", "tok-no"],
+        }
+        flight_row = "21:" + json.dumps(["$", "component", None, {"dehydratedState": {"queries": [{"state": {"data": {"markets": [market]}}}]}}]) + "\n"
+        page = f"<html><script>self.__next_f.push({json.dumps([1, flight_row])})</script></html>"
+
+        data = scanner.extract_next_json(page)
+        markets = scanner.extract_markets(data)
+
+        self.assertEqual(len(markets), 1)
+        self.assertEqual(markets[0]["market_id"], "0xabc")
+        self.assertEqual(markets[0]["title"], market["question"])
+        self.assertEqual(markets[0]["outcomes"], ["Yes", "No"])
+        self.assertEqual(markets[0]["prices"], [0.25, 0.75])
+        self.assertEqual(markets[0]["token_ids"], ["tok-yes", "tok-no"])
+        self.assertEqual(markets[0]["source_url"], market["resolutionSource"])
+
     def test_bucket_bounds_fahrenheit_range_not_negative(self):
         for label in ("81-82F", "81-82°F", "81–82F", "81 — 82 F", "81 to 82°F"):
             with self.subTest(label=label):
@@ -564,6 +681,88 @@ class WeatherEdgeTests(unittest.TestCase):
             self.assertEqual([row[3] for row in rows], [before_features, before_features])
             self.assertEqual(db.execute("select count(*) from label_attempts where outcome_status='final'").fetchone()[0], 1)
 
+    def test_label_candidate_groups_prioritizes_stationed_rows_and_metric_retry_key(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+            db.execute(
+                """
+                insert into training_rows(
+                  created_at, market_id, title, outcome, city, target_date,
+                  station_id, station_source, source_confidence, market_family,
+                  target_metric, signal_type
+                ) values(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "2020-01-01T00:00:00+00:00",
+                    "m-missing-station",
+                    "Will the highest temperature in Denver be 80°F or above?",
+                    "Yes",
+                    "Denver",
+                    "2020-01-01",
+                    "",
+                    "parser",
+                    "low",
+                    "daily_temperature",
+                    scanner.TARGET_METRIC_DAILY_HIGH,
+                    "paper_buy_test",
+                ),
+            )
+            db.execute(
+                """
+                insert into training_rows(
+                  created_at, market_id, title, outcome, city, target_date,
+                  station_id, station_source, source_confidence, market_family,
+                  target_metric, signal_type
+                ) values(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "2020-01-02T00:00:00+00:00",
+                    "m-stationed",
+                    "Will the highest temperature in Denver be 80°F or above?",
+                    "Yes",
+                    "Denver",
+                    "2020-01-02",
+                    "KDEN",
+                    "station_registry",
+                    "high",
+                    "daily_temperature",
+                    scanner.TARGET_METRIC_DAILY_HIGH,
+                    "paper_buy_test",
+                ),
+            )
+            db.commit()
+
+            candidates = scanner.label_candidate_groups(db, "2020-01-10", "1999-01-01T00:00:00+00:00", 1)
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["market_id"], "m-stationed")
+            self.assertEqual(candidates[0]["station_id"], "KDEN")
+            self.assertEqual(candidates[0]["target_metric"], scanner.TARGET_METRIC_DAILY_HIGH)
+
+            db.execute(
+                """
+                insert into label_attempts(
+                  attempted_at, market_id, title, outcome, target_date, station_id,
+                  source_provider, outcome_status, target_metric
+                ) values(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "2020-01-09T00:00:00+00:00",
+                    "m-stationed",
+                    "Will the highest temperature in Denver be 80°F or above?",
+                    "Yes",
+                    "2020-01-02",
+                    "KDEN",
+                    "noaa_ncei",
+                    scanner.PENDING_LABEL_STATUS,
+                    scanner.TARGET_METRIC_DAILY_HIGH,
+                ),
+            )
+            db.commit()
+
+            retried = scanner.label_candidate_groups(db, "2020-01-10", "2020-01-08T00:00:00+00:00", 1)
+            self.assertEqual(len(retried), 1)
+            self.assertEqual(retried[0]["market_id"], "m-missing-station")
+
     def test_label_based_settlement_preserves_accounting(self):
         with tempfile.TemporaryDirectory() as td:
             db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
@@ -755,7 +954,7 @@ class WeatherEdgeTests(unittest.TestCase):
             self.assertEqual(db.execute("select status, reason from paper_orders").fetchone(), ("skipped", "strategy_family_survival_gate_disabled"))
             self.assertEqual(db.execute("select count(*) from paper_fills").fetchone()[0], 0)
             self.assertEqual(db.execute("select count(*) from paper_positions").fetchone()[0], 0)
-            self.assertEqual(db.execute("select cash from paper_accounts where name=?", (scanner.DEFAULT_ACCOUNT_NAME,)).fetchone()[0], 1000.0)
+            self.assertEqual(db.execute("select cash from paper_accounts where name=?", (scanner.active_paper_account_name(),)).fetchone()[0], 1000.0)
             self.assertEqual(db.execute("select shadow_reason, strategy_family from shadow_orders").fetchone(), ("survival_gate_disabled", "killed_family"))
             self.assertEqual(db.execute("select shares, price, cost, source from shadow_fills").fetchone(), (5.0, 0.40, 2.0, "clob_book"))
             db.close()
@@ -803,7 +1002,7 @@ class WeatherEdgeTests(unittest.TestCase):
             self.assertEqual(db.execute("select count(*) from paper_fills").fetchone()[0], 0)
             self.assertEqual(db.execute("select count(*) from paper_positions").fetchone()[0], 0)
             self.assertEqual(db.execute("select shadow_reason from shadow_orders").fetchone()[0], "below_min_entry_shadow_only")
-            self.assertEqual(db.execute("select cash from paper_accounts where name=?", (scanner.DEFAULT_ACCOUNT_NAME,)).fetchone()[0], 1000.0)
+            self.assertEqual(db.execute("select cash from paper_accounts where name=?", (scanner.active_paper_account_name(),)).fetchone()[0], 1000.0)
             db.close()
 
     def test_min_entry_blocks_dust_for_all_strategy_families(self):
@@ -993,11 +1192,11 @@ class WeatherEdgeTests(unittest.TestCase):
             self.assertEqual(row, (1, 89.5, 89.0, 0.5, 0.40, "latency_absorbing_state"))
             db.close()
 
-    def test_labeler_uses_read_only_final_label_source_by_default(self):
+    def test_labeler_uses_enabled_read_only_final_label_sources_by_default(self):
         args = scanner.build_parser().parse_args(["label", "--dry-run", "--limit", "0"])
         self.assertTrue(args.enable_ncei)
-        self.assertFalse(args.enable_nws)
-        self.assertFalse(args.enable_iem)
+        self.assertTrue(args.enable_nws)
+        self.assertTrue(args.enable_iem)
 
     def test_no_live_trading_guard_blocks_prohibited_options(self):
         self.assertTrue(scanner.ensure_paper_only_guard(argparse.Namespace()))
