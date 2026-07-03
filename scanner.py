@@ -283,12 +283,12 @@ STATION_REGISTRY = {
     "tokyo": {"station_id": "RJTT", "station_name": "Tokyo Haneda Airport", "timezone": "Asia/Tokyo", "source_reliability": "medium"},
 }
 NCEI_STATION_ID_CROSSWALK = {
-    "KAUS": "GHCND:USW00013958",
-    "KDEN": "GHCND:USW00003017",
-    "KLAX": "GHCND:USW00023174",
-    "KLGA": "GHCND:USW00014732",
-    "KMIA": "GHCND:USW00012839",
-    "KORD": "GHCND:USW00094846",
+    "KAUS": "USW00013958",
+    "KDEN": "USW00003017",
+    "KLAX": "USW00023174",
+    "KLGA": "USW00014732",
+    "KMIA": "USW00012839",
+    "KORD": "USW00094846",
 }
 
 
