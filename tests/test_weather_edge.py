@@ -1205,6 +1205,66 @@ class WeatherEdgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             scanner.ensure_paper_only_guard(argparse.Namespace(private_key="not-allowed"))
 
+    def test_reconcile_zombie_positions_syncs_stale_open_to_settled(self):
+        """Positions stuck in 'open' with an existing settlement record should be reconciled."""
+        with tempfile.TemporaryDirectory() as td:
+            db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+            # Simulate a position + settlement (the zombie state)
+            now = "2026-07-03T21:00:00+00:00"
+            acct = scanner.account_row(db)
+            account_id = int(acct[0])
+            db.execute(
+                """insert into paper_positions
+                   (account_id, market_id, outcome, shares, avg_price, cost_basis,
+                    realized_pnl, status, updated_at, strategy_family)
+                   values(?,?,?,?,?,?,?,?,?,?)""",
+                (account_id, "m-zombie", "Yes", 100.0, 0.05, 5.0, 0.0, "open", "2026-06-06T00:00:00+00:00", "ladder_inconsistency"),
+            )
+            pos_id = db.execute("select last_insert_rowid()").fetchone()[0]
+            db.execute(
+                """insert into paper_settlements
+                   (position_id, settled_at, outcome_status, payout, realized_pnl,
+                    event_key, strategy_family)
+                   values(?,?,?,?,?,?,?)""",
+                (pos_id, "2026-05-09T05:00:00+00:00", "resolved_loss", 0.0, -5.0, "city-2026-05-09", "ladder_inconsistency"),
+            )
+            db.commit()
+            # Before reconcile: position is open
+            self.assertEqual(
+                db.execute("select status from paper_positions where id=?", (pos_id,)).fetchone()[0],
+                "open",
+            )
+            fixed = scanner.reconcile_zombie_positions(db, now)
+            db.commit()
+            self.assertEqual(fixed, 1)
+            # After reconcile: position is settled with correct realized_pnl
+            row = db.execute("select status, realized_pnl from paper_positions where id=?", (pos_id,)).fetchone()
+            self.assertEqual(row[0], "settled")
+            self.assertAlmostEqual(row[1], -5.0)
+
+    def test_reconcile_does_not_touch_positions_without_settlements(self):
+        """Positions genuinely open (no settlement) must not be touched."""
+        with tempfile.TemporaryDirectory() as td:
+            db = scanner.init_db(os.path.join(td, "paper.sqlite3"))
+            now = "2026-07-03T21:00:00+00:00"
+            acct = scanner.account_row(db)
+            account_id = int(acct[0])
+            db.execute(
+                """insert into paper_positions
+                   (account_id, market_id, outcome, shares, avg_price, cost_basis,
+                    realized_pnl, status, updated_at, strategy_family)
+                   values(?,?,?,?,?,?,?,?,?,?)""",
+                (account_id, "m-real", "Yes", 100.0, 0.05, 5.0, 0.0, "open", now, "ladder_inconsistency"),
+            )
+            db.commit()
+            fixed = scanner.reconcile_zombie_positions(db, now)
+            self.assertEqual(fixed, 0)
+            pos_id = db.execute("select id from paper_positions where market_id='m-real'").fetchone()[0]
+            self.assertEqual(
+                db.execute("select status from paper_positions where id=?", (pos_id,)).fetchone()[0],
+                "open",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
