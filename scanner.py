@@ -742,7 +742,7 @@ def clean_city(s: str) -> str:
 
 def geocode(city: str) -> dict[str, Any] | None:
     q = urllib.parse.urlencode({"name": city, "count": 1, "language": "en", "format": "json"})
-    data = fetch_json(f"https://geocoding-api.open-meteo.com/v1/search?{q}")
+    data = fetch_json(f"https://geocoding-api.open-meteo.com/v1/search?{q}", timeout=5)
     results = data.get("results") if isinstance(data, dict) else None
     return results[0] if results else None
 
@@ -759,7 +759,7 @@ def forecast_high_f(lat: float, lon: float, date: str) -> float | None:
             "end_date": date,
         }
     )
-    data = fetch_json(f"https://api.open-meteo.com/v1/forecast?{q}")
+    data = fetch_json(f"https://api.open-meteo.com/v1/forecast?{q}", timeout=5)
     vals = data.get("daily", {}).get("temperature_2m_max", []) if isinstance(data, dict) else []
     return float(vals[0]) if vals and vals[0] is not None else None
 
@@ -3715,8 +3715,15 @@ def settle_paper_positions_from_latest_prices(db: sqlite3.Connection, now: str) 
             continue
         payout = float(shares) if status == "resolved_win" else 0.0
         realized = payout - float(cost_basis)
-        existing = db.execute("select id from paper_settlements where position_id=?", (pos_id,)).fetchone()
+        existing = db.execute(
+            "select id, realized_pnl from paper_settlements where position_id=?", (pos_id,)
+        ).fetchone()
         if existing:
+            # Settlement already recorded — sync position status if it drifted to 'open'
+            db.execute(
+                "update paper_positions set status='settled', realized_pnl=?, updated_at=? where id=? and status='open'",
+                (existing[1], now, pos_id),
+            )
             continue
         db.execute(
             """
@@ -3733,6 +3740,31 @@ def settle_paper_positions_from_latest_prices(db: sqlite3.Connection, now: str) 
             "update paper_accounts set cash=cash+?, realized_pnl=realized_pnl+?, updated_at=? where id=?",
             (payout, realized, now, account_id),
         )
+
+
+def reconcile_zombie_positions(db: sqlite3.Connection, now: str) -> int:
+    """Sync any position stuck in 'open' that already has a settlement record.
+
+    This handles legacy/cutover scenarios where a settlement was recorded but
+    the position status was never updated to 'settled'. Does NOT create new
+    settlements — only syncs status to match existing settlement evidence.
+    """
+    zombies = db.execute(
+        """
+        select pp.id, ps.realized_pnl
+        from paper_positions pp
+        join paper_settlements ps on ps.position_id = pp.id
+        where pp.status = 'open'
+        """,
+    ).fetchall()
+    fixed = 0
+    for pos_id, realized_pnl in zombies:
+        db.execute(
+            "update paper_positions set status='settled', realized_pnl=?, updated_at=? where id=?",
+            (realized_pnl, now, pos_id),
+        )
+        fixed += 1
+    return fixed
 
 
 def portfolio_metrics(db: sqlite3.Connection) -> dict[str, Any]:
@@ -4211,6 +4243,7 @@ def scan(args: argparse.Namespace) -> None:
             contract_count=len(pending_rows),
         )
     db.execute("update runs set markets_seen=?, signals_seen=? where id=?", (len(markets), signal_count, run_id))
+    reconcile_zombie_positions(db, now)
     settle_paper_positions_from_latest_prices(db, now)
     settle_paper_positions_from_labels(db, now)
     record_account_snapshot(db, run_id, now)
@@ -4975,8 +5008,15 @@ def settle_paper_positions_from_labels(db: sqlite3.Connection, now: str) -> int:
         event_key = (meta[0] if meta else None) or position_event_key
         strategy_family = (meta[1] if meta else None) or position_strategy_family
         candidate_key = meta[2] if meta else None
-        existing = db.execute("select id from paper_settlements where position_id=?", (pos_id,)).fetchone()
+        existing = db.execute(
+            "select id, realized_pnl from paper_settlements where position_id=?", (pos_id,)
+        ).fetchone()
         if existing:
+            # Settlement already recorded — sync position status if it drifted to 'open'
+            db.execute(
+                "update paper_positions set status='settled', realized_pnl=?, updated_at=? where id=? and status='open'",
+                (existing[1], now, pos_id),
+            )
             continue
         payout = float(shares) * float(label_value)
         realized = payout - float(cost_basis)
@@ -5097,6 +5137,15 @@ def label(args: argparse.Namespace) -> None:
         f"provisional_attempts={provisional} pending_attempts={pending} "
         f"skipped_attempts={skipped} error_attempts={errors} settled_positions={settled_positions}"
     )
+
+
+def reconcile(args: argparse.Namespace) -> None:
+    """Reconcile zombie positions: sync any position stuck in 'open' that already has a settlement record."""
+    db = init_db(args.db)
+    now = utc_now_iso()
+    fixed = reconcile_zombie_positions(db, now)
+    db.commit()
+    print(f"reconciled {fixed} zombie position(s) to 'settled'")
 
 
 def evaluate(args: argparse.Namespace) -> None:
@@ -5321,6 +5370,7 @@ def portfolio(args: argparse.Namespace) -> None:
     db = init_db(args.db)
     now = utc_now_iso()
     if args.settle:
+        reconcile_zombie_positions(db, now)
         settle_paper_positions_from_latest_prices(db, now)
     if getattr(args, "settle_labels", False):
         settle_paper_positions_from_labels(db, now)
@@ -5533,6 +5583,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--min-entry", type=float, default=0.02, help="Skip dust/stale entries below this entry price")
     e.add_argument("--all-signals", action="store_true", help="Evaluate watch/skip rows too; default is paper_buy only")
     e.set_defaults(func=evaluate)
+    rc = sub.add_parser("reconcile", help="Sync zombie positions stuck in 'open' that already have settlement records")
+    rc.set_defaults(func=reconcile)
     return p
 
 
