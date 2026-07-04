@@ -5589,6 +5589,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Set a socket-level default timeout as a safety net against DNS/SSL/connect
+    # hangs that urllib's per-request timeout does NOT cover. Without this, a
+    # stalled SSL handshake on a government weather API can hang the labeler
+    # indefinitely, causing the cron worker to hit its hard timeout with zero
+    # output. 30s is generous enough for any legitimate connection but short
+    # enough to prevent the 55-minute hangs we've been seeing.
+    import socket
+    socket.setdefaulttimeout(30)
+
     args = build_parser().parse_args(argv)
     try:
         ensure_paper_only_guard(args)
