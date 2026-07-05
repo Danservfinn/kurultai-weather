@@ -1194,7 +1194,11 @@ class WeatherEdgeTests(unittest.TestCase):
 
     def test_labeler_uses_enabled_read_only_final_label_sources_by_default(self):
         args = scanner.build_parser().parse_args(["label", "--dry-run", "--limit", "0"])
-        self.assertTrue(args.enable_ncei)
+        # NCEI is disabled by default (runtime_tunables.env ENABLE_NCEI_DAILY=0)
+        # because www.ncei.noaa.gov stalls on SSL handshake, causing labeler
+        # hangs (fix commit eb25d8a). Source weight is 0.00 so disabling has
+        # zero prediction impact.
+        self.assertFalse(args.enable_ncei)
         self.assertTrue(args.enable_nws)
         self.assertTrue(args.enable_iem)
 
